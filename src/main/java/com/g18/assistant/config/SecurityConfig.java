@@ -30,6 +30,7 @@ public class SecurityConfig {
     private static final String[] API_PUBLIC = {
         "/api/auth/**",           // Authentication endpoints
         "/api/password/**",       // Password reset endpoints
+        "/api/facebook/webhook/**", // Facebook webhook endpoint
         "/v3/api-docs/**",       // Swagger documentation
         "/swagger-ui/**",
         "/swagger-ui.html"
@@ -37,7 +38,8 @@ public class SecurityConfig {
 
     private static final String[] API_PROTECTED = {
         "/api/profile/**",        // User profile endpoints
-        "/api/payments/**"        // Payment endpoints
+        "/api/payments/**",       // Payment endpoints
+        "/api/integration/**"     // Integration token endpoints
     };
 
     @Bean
