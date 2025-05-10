@@ -115,7 +115,7 @@ public class ProductServiceImpl implements ProductService {
     @Override
     @Transactional(readOnly = true)
     public PageResponse<ProductResponse> searchShopProducts(Long shopId, String keyword, Pageable pageable) {
-        Page<Product> productPage = productRepository.searchProductsByShop(shopId, keyword, pageable);
+        Page<Product> productPage = productRepository.searchProducts(shopId, keyword, pageable);
         
         Page<ProductResponse> responsePage = productPage.map(ProductResponse::fromEntityWithoutImage);
         

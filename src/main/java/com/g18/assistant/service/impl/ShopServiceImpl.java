@@ -8,6 +8,7 @@ import com.g18.assistant.mapper.ShopMapper;
 import com.g18.assistant.repository.ShopRepository;
 import com.g18.assistant.repository.UserRepository;
 import com.g18.assistant.service.ShopService;
+import jakarta.persistence.EntityNotFoundException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
@@ -119,5 +120,12 @@ public class ShopServiceImpl implements ShopService {
                 .orElseThrow(() -> new UsernameNotFoundException("User not found with id: " + userId));
         
         return shopRepository.existsByIdAndUser(shopId, user);
+    }
+    
+    @Override
+    @Transactional(readOnly = true)
+    public Shop getShopByIdForBotServices(Long shopId) {
+        return shopRepository.findById(shopId)
+                .orElseThrow(() -> new EntityNotFoundException("Shop not found with id: " + shopId));
     }
 } 

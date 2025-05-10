@@ -1,5 +1,6 @@
 package com.g18.assistant.service.impl;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.g18.assistant.dto.FacebookBotStatusDto;
 import com.g18.assistant.dto.FacebookMessageDto;
@@ -7,6 +8,7 @@ import com.g18.assistant.dto.FacebookWebhookConfigDto;
 import com.g18.assistant.entity.FacebookAccessToken;
 import com.g18.assistant.repository.FacebookAccessTokenRepository;
 import com.g18.assistant.service.FacebookBotService;
+import com.g18.assistant.service.ShopAIService;
 import jakarta.persistence.EntityNotFoundException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,8 +32,9 @@ import java.util.Optional;
 public class FacebookBotServiceImpl implements FacebookBotService {
 
     private final FacebookAccessTokenRepository facebookAccessTokenRepository;
-    private final RestTemplate restTemplate = new RestTemplate();
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final RestTemplate restTemplate;
+    private final ObjectMapper objectMapper;
+    private final ShopAIService shopAIService;
     
     @Value("${app.facebook.api.url:https://graph.facebook.com/v18.0}")
     private String facebookApiUrl;
@@ -162,17 +165,53 @@ public class FacebookBotServiceImpl implements FacebookBotService {
                     
                     log.info("Received message from {}: {}", senderId, messageText);
                     
-                    // Here you would call your AI service to generate a response
-                    // For now, let's just echo the message back
-                    String response = "Echo: " + messageText;
-                    
-                    // Extract shopId from recipientId or use another method to identify the shop
-                    // For demo purposes, we'll assume the recipientId matches a page that belongs to a shop
-                    // In a real implementation, you'd need to map the page ID to the shop ID
+                    // Get the shop ID from page ID
                     Long shopId = findShopIdByPageId(recipientId);
                     
                     if (shopId != null) {
-                        sendMessage(shopId, senderId, response);
+                        // Process message with AI service
+                        try {
+                            // Call our AI service to get a response
+                            String aiResponse = shopAIService.processCustomerMessage(
+                                    shopId, senderId, "Facebook User", messageText);
+                            
+                            // Parse the AI response
+                            JsonNode responseJson = objectMapper.readTree(aiResponse);
+                            
+                            // Check if there was an error
+                            if (responseJson.has("error") && responseJson.get("error").asBoolean()) {
+                                log.error("AI error: {}", responseJson.get("message").asText());
+                                sendMessage(shopId, senderId, "I'm sorry, I'm having trouble understanding your request right now. Please try again later.");
+                                return;
+                            }
+                            
+                            // Extract the human-readable response text
+                            String responseText = responseJson.has("response_text") ? 
+                                    responseJson.get("response_text").asText() : 
+                                    "Thank you for your message. I'll get back to you soon.";
+                            
+                            // Send the response to the user
+                            sendMessage(shopId, senderId, responseText);
+                            
+                            // Log detected intent for monitoring
+                            if (responseJson.has("detected_intent")) {
+                                String intent = responseJson.get("detected_intent").asText();
+                                log.info("AI detected intent for Shop {}, User {}: {}", 
+                                        shopId, senderId, intent);
+                            }
+                            
+                            // Handle any actions that need to be performed
+                            if (responseJson.has("action_required") && responseJson.get("action_required").asBoolean()) {
+                                log.info("AI indicates action required for Shop {}, User {}", 
+                                        shopId, senderId);
+                                // In a real implementation, we would act on the action_details
+                                // For example, creating orders, checking status, etc.
+                            }
+                            
+                        } catch (Exception e) {
+                            log.error("Error processing message with AI: {}", e.getMessage(), e);
+                            sendMessage(shopId, senderId, "I'm sorry, I couldn't process your request. Please try again later.");
+                        }
                     } else {
                         log.warn("Could not find shop for page ID: {}", recipientId);
                     }

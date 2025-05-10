@@ -92,4 +92,13 @@ public interface ShopService {
      * @return true if the user is the owner, false otherwise
      */
     boolean isShopOwner(Long userId, Long shopId);
+    
+    /**
+     * Get a shop by ID without user validation (for bot services)
+     * 
+     * @param shopId The ID of the shop
+     * @return The shop entity if found
+     * @throws jakarta.persistence.EntityNotFoundException if the shop doesn't exist
+     */
+    Shop getShopByIdForBotServices(Long shopId);
 } 

@@ -18,12 +18,30 @@ public interface ProductRepository extends JpaRepository<Product, Long> {
     
     Page<Product> findByShopIdAndActiveTrue(Long shopId, Pageable pageable);
     
+    /**
+     * Find a product by ID and shop ID
+     * 
+     * @param id The product ID
+     * @param shopId The shop ID
+     * @return The product if found
+     */
     Optional<Product> findByIdAndShopId(Long id, Long shopId);
+    
+    /**
+     * Find all products belonging to a shop
+     * 
+     * @param shopId The shop ID
+     * @param pageable Pagination information
+     * @return Page of products
+     */
+    Page<Product> findByShopId(Long shopId, Pageable pageable);
     
     @Query("SELECT p FROM Product p WHERE p.shop.id = :shopId AND p.active = true AND " +
            "(LOWER(p.name) LIKE LOWER(CONCAT('%', :keyword, '%')) OR " +
-           "LOWER(p.description) LIKE LOWER(CONCAT('%', :keyword, '%')))")
-    Page<Product> searchProductsByShop(Long shopId, String keyword, Pageable pageable);
+           "LOWER(p.description) LIKE LOWER(CONCAT('%', :keyword, '%')) OR " +
+           "LOWER(p.category) LIKE LOWER(CONCAT('%', :keyword, '%'))) " +
+           "AND p.active = true")
+    Page<Product> searchProducts(Long shopId, String keyword, Pageable pageable);
     
     @Query("SELECT p FROM Product p WHERE p.active = true AND " +
            "(LOWER(p.name) LIKE LOWER(CONCAT('%', :keyword, '%')) OR " +
