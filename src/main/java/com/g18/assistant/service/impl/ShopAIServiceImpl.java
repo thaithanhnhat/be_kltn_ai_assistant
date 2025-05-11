@@ -4,14 +4,19 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.g18.assistant.dto.OrderDTO;
+import com.g18.assistant.dto.request.CreateOrderRequest;
+import com.g18.assistant.dto.request.UpdateOrderStatusRequest;
 import com.g18.assistant.dto.response.ProductResponse;
 import com.g18.assistant.entity.Customer;
+import com.g18.assistant.entity.Order.OrderStatus;
 import com.g18.assistant.entity.Product;
 import com.g18.assistant.entity.Shop;
 import com.g18.assistant.repository.CustomerRepository;
 import com.g18.assistant.repository.ProductRepository;
 import com.g18.assistant.service.ConversationHistoryService;
 import com.g18.assistant.service.CustomerService;
+import com.g18.assistant.service.OrderService;
 import com.g18.assistant.service.ProductService;
 import com.g18.assistant.service.ShopAIService;
 import com.g18.assistant.service.ShopService;
@@ -28,6 +33,7 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.HashMap;
 
 @Service
 @RequiredArgsConstructor
@@ -42,6 +48,7 @@ public class ShopAIServiceImpl implements ShopAIService {
     private final ProductRepository productRepository;
     private final ConversationHistoryService conversationHistoryService;
     private final CustomerService customerService;
+    private final OrderService orderService;
 
     @Value("${app.gemini.api-key}")
     private String geminiApiKey;
@@ -55,6 +62,13 @@ public class ShopAIServiceImpl implements ShopAIService {
     @Override
     public String processCustomerMessage(Long shopId, String customerId, String customerName, String message) {
         try {
+            // Track if an order has been created for this message to prevent duplicates
+            boolean orderCreated = false;
+            boolean orderCancelled = false;
+            
+            // Declare aiResponseJson outside the try-catch block so it can be accessed later
+            JsonNode aiResponseJson = null;
+            
             // Extract potentially useful customer information from the message
             Map<String, String> extractedInfo = customerService.extractCustomerInfoFromMessage(message);
             
@@ -127,6 +141,9 @@ public class ShopAIServiceImpl implements ShopAIService {
 
             // Format history string
             String historyStr = formatConversationHistory(history);
+            
+            // Check if this message is likely just providing an address (quick check before AI call)
+            boolean isLikelyAddressOnly = isProbablyAddressOnly(message, history);
 
             // First, analyze the intent without loading all shop data
             String intentAnalysis = analyzeMessageIntent(message, history);
@@ -135,7 +152,53 @@ public class ShopAIServiceImpl implements ShopAIService {
                 return intentAnalysis;
             }
             
+            // Extract address and phone from AI's analysis if available
+            String extractedAddress = null;
+            String extractedPhone = null;
+            
+            if (analysisJson.has("extracted_address") && !analysisJson.get("extracted_address").isNull() && !analysisJson.get("extracted_address").asText().isEmpty()) {
+                extractedAddress = analysisJson.get("extracted_address").asText();
+                log.info("AI extracted address: {}", extractedAddress);
+            }
+            
+            if (analysisJson.has("extracted_phone") && !analysisJson.get("extracted_phone").isNull() && !analysisJson.get("extracted_phone").asText().isEmpty()) {
+                extractedPhone = analysisJson.get("extracted_phone").asText();
+                log.info("AI extracted phone: {}", extractedPhone);
+            }
+            
+            // Update customer info with address and phone if available
+            if (customer != null && (extractedAddress != null || extractedPhone != null)) {
+                Map<String, String> customerUpdates = new HashMap<>();
+                
+                if (extractedAddress != null && (customer.getAddress() == null || customer.getAddress().isEmpty() 
+                    || customer.getAddress().equals("Đang cập nhật"))) {
+                    customerUpdates.put("address", extractedAddress);
+                }
+                
+                if (extractedPhone != null && (customer.getPhone() == null || customer.getPhone().isEmpty())) {
+                    customerUpdates.put("phone", extractedPhone);
+                }
+                
+                if (!customerUpdates.isEmpty()) {
+                    customer = customerService.updateCustomerInfo(customer.getId(), customerUpdates);
+                    log.info("Updated customer with AI extracted information: {}", customerUpdates);
+                }
+            }
+            
             String detectedIntent = analysisJson.path("detected_intent").asText("GENERAL_QUERY");
+            
+            // Special handling for ADDRESS_RESPONSE intent - never process as an order
+            if ("ADDRESS_RESPONSE".equals(detectedIntent)) {
+                log.info("Detected ADDRESS_RESPONSE intent, will only update customer information with address");
+                
+                // If this is just an address response, just process the AI response
+                // without trying to create any orders from it
+                boolean needsShopContext = analysisJson.path("needs_shop_context").asBoolean(false);
+                if (!needsShopContext) {
+                    log.info("Simple address response detected, returning without any order processing");
+                    return intentAnalysis;
+                }
+            }
             
             // Only check for missing address when the customer is trying to place an order
             if ("PLACEORDER".equals(detectedIntent) && customer != null) {
@@ -143,6 +206,59 @@ public class ShopAIServiceImpl implements ShopAIService {
                 if (addressCheckResponse != null) {
                     return addressCheckResponse;
                 }
+            }
+            
+            // Skip order processing for likely address-only messages or ADDRESS_RESPONSE intent
+            if (!isLikelyAddressOnly && !"ADDRESS_RESPONSE".equals(detectedIntent)) {
+                // Process order from initial intent analysis only if it has all required information
+                // and we're handling a simple query that doesn't need full shop context
+                if (!orderCreated && "PLACEORDER".equals(detectedIntent) && 
+                    analysisJson.has("action_required") && analysisJson.get("action_required").asBoolean() &&
+                    analysisJson.has("action_details") && customer != null) {
+                    
+                    // First, check if address is listed as missing information
+                    boolean addressIsMissing = false;
+                    if (analysisJson.has("missing_information") && analysisJson.get("missing_information").isArray()) {
+                        JsonNode missingInfoArray = analysisJson.get("missing_information");
+                        for (JsonNode item : missingInfoArray) {
+                            String missingItem = item.asText();
+                            if (missingItem.contains("address") || missingItem.contains("địa chỉ") || 
+                                missingItem.equals("delivery_address") || missingItem.equals("shipping_address")) {
+                                addressIsMissing = true;
+                                log.info("Not creating order yet because address is listed as missing information");
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Only proceed if address is not listed as missing
+                    if (!addressIsMissing) {
+                        JsonNode actionDetails = analysisJson.get("action_details");
+                        if (actionDetails.has("action_type") && 
+                            "PLACEORDER".equals(actionDetails.get("action_type").asText()) && 
+                            actionDetails.has("product_id") && actionDetails.has("quantity")) {
+                            
+                            Long productId = actionDetails.get("product_id").asLong();
+                            int quantity = actionDetails.get("quantity").asInt();
+                            
+                            // Only attempt to place order if we have the required address
+                            if (extractedAddress != null || 
+                                (customer.getAddress() != null && !customer.getAddress().isEmpty() && 
+                                 !customer.getAddress().equals("Đang cập nhật"))) {
+                                
+                                // Save the order
+                                saveOrderFromAI(customer.getId(), productId, quantity);
+                                orderCreated = true;
+                                log.info("Order created from intent analysis: Product ID: {}, Quantity: {}", 
+                                        productId, quantity);
+                            } else {
+                                log.info("Not creating order yet because no address is available");
+                            }
+                        }
+                    }
+                }
+            } else {
+                log.info("Skipping initial order processing for likely address-only message");
             }
             
             boolean needsShopContext = analysisJson.path("needs_shop_context").asBoolean(false);
@@ -160,6 +276,134 @@ public class ShopAIServiceImpl implements ShopAIService {
             // Tạo prompt với lịch sử hội thoại và danh sách thể loại
             String prompt = historyStr + buildAIPrompt(shop, products, customer, customerName, message, categories);
             String aiResponse = callGeminiWithStructuredFormat(prompt);
+            
+            // Process order if the AI identified the intent as PLACEORDER
+            try {
+                aiResponseJson = objectMapper.readTree(aiResponse);
+                
+                // Check if there are additional address/phone values in the full AI response
+                if (aiResponseJson.has("extracted_address") && !aiResponseJson.get("extracted_address").isNull() 
+                    && !aiResponseJson.get("extracted_address").asText().isEmpty()) {
+                    extractedAddress = aiResponseJson.get("extracted_address").asText();
+                    log.info("Full AI response extracted address: {}", extractedAddress);
+                }
+                
+                if (aiResponseJson.has("extracted_phone") && !aiResponseJson.get("extracted_phone").isNull() 
+                    && !aiResponseJson.get("extracted_phone").asText().isEmpty()) {
+                    extractedPhone = aiResponseJson.get("extracted_phone").asText();
+                    log.info("Full AI response extracted phone: {}", extractedPhone);
+                }
+                
+                // Update customer again if new information was found
+                if (customer != null && (extractedAddress != null || extractedPhone != null)) {
+                    Map<String, String> customerUpdates = new HashMap<>();
+                    
+                    if (extractedAddress != null && (customer.getAddress() == null || customer.getAddress().isEmpty() 
+                        || customer.getAddress().equals("Đang cập nhật"))) {
+                        customerUpdates.put("address", extractedAddress);
+                    }
+                    
+                    if (extractedPhone != null && (customer.getPhone() == null || customer.getPhone().isEmpty())) {
+                        customerUpdates.put("phone", extractedPhone);
+                    }
+                    
+                    if (!customerUpdates.isEmpty()) {
+                        customer = customerService.updateCustomerInfo(customer.getId(), customerUpdates);
+                        log.info("Updated customer with full AI extracted information: {}", customerUpdates);
+                    }
+                }
+                
+                // Only process order if one hasn't been created yet and this isn't just an address response
+                String fullResponseIntent = aiResponseJson.path("detected_intent").asText("GENERAL_QUERY");
+                if (!orderCreated && 
+                    !isLikelyAddressOnly && 
+                    !"ADDRESS_RESPONSE".equals(fullResponseIntent) &&
+                    "PLACEORDER".equals(fullResponseIntent) && 
+                    aiResponseJson.has("action_required") && 
+                    aiResponseJson.get("action_required").asBoolean() &&
+                    aiResponseJson.has("action_details")) {
+                    
+                    // Check if address is listed as missing information
+                    boolean addressIsMissing = false;
+                    if (aiResponseJson.has("missing_information") && aiResponseJson.get("missing_information").isArray()) {
+                        JsonNode missingInfoArray = aiResponseJson.get("missing_information");
+                        for (JsonNode item : missingInfoArray) {
+                            String missingItem = item.asText();
+                            if (missingItem.contains("address") || missingItem.contains("địa chỉ") || 
+                                missingItem.equals("delivery_address") || missingItem.equals("shipping_address")) {
+                                addressIsMissing = true;
+                                log.info("Not creating order yet because address is listed as missing information in full response");
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Only proceed if address isn't missing
+                    if (!addressIsMissing) {
+                        JsonNode actionDetails = aiResponseJson.get("action_details");
+                        if (actionDetails.has("action_type") && 
+                            "PLACEORDER".equals(actionDetails.get("action_type").asText()) && 
+                            actionDetails.has("product_id") && 
+                            actionDetails.has("quantity") && 
+                            customer != null) {
+                                
+                            Long productId = actionDetails.get("product_id").asLong();
+                            int quantity = actionDetails.get("quantity").asInt();
+                            
+                            // Extract address and phone from the customer's message or action details
+                            String address = extractedAddress;
+                            if (address == null) {
+                                address = extractAddressFromMessage(message);
+                            }
+                            
+                            String phone = extractedPhone;
+                            if (phone == null) {
+                                phone = extractPhoneFromMessage(message);
+                            }
+                            
+                            // Update the customer record with address and phone if available
+                            Map<String, String> customerUpdates = new HashMap<>();
+                            if (address != null && !address.isEmpty() && 
+                                (customer.getAddress() == null || customer.getAddress().isEmpty() || customer.getAddress().equals("Đang cập nhật"))) {
+                                customerUpdates.put("address", address);
+                                log.info("Updating customer address: {}", address);
+                            }
+                            
+                            if (phone != null && !phone.isEmpty() && 
+                                (customer.getPhone() == null || customer.getPhone().isEmpty())) {
+                                customerUpdates.put("phone", phone);
+                                log.info("Updating customer phone: {}", phone);
+                            }
+                            
+                            // If we have customer info to update, do it now
+                            if (!customerUpdates.isEmpty()) {
+                                customer = customerService.updateCustomerInfo(customer.getId(), customerUpdates);
+                                log.info("Updated customer information before order creation: {}", customerUpdates);
+                            }
+                            
+                            // Do we have an address to proceed with order?
+                            if (address != null || 
+                               (customer.getAddress() != null && !customer.getAddress().isEmpty() && 
+                                !customer.getAddress().equals("Đang cập nhật"))) {
+                                // Save the order only once
+                                saveOrderFromAI(customer.getId(), productId, quantity);
+                                orderCreated = true;
+                                
+                                log.info("Order saved successfully from AI response: Product ID: {}, Quantity: {}, Customer ID: {}", 
+                                        productId, quantity, customer.getId());
+                            } else {
+                                log.info("Not creating order because no valid address is available");
+                            }
+                        }
+                    }
+                } else if (isLikelyAddressOnly || "ADDRESS_RESPONSE".equals(fullResponseIntent)) {
+                    log.info("Skipping order processing for address-only message");
+                }
+            } catch (Exception ex) {
+                log.error("Error processing AI response for order creation: {}", ex.getMessage(), ex);
+                // We don't want to fail the whole response if order creation fails
+            }
+            
             // Lưu phản hồi AI vào lịch sử
             try {
                 JsonNode aiJson = objectMapper.readTree(aiResponse);
@@ -168,6 +412,81 @@ public class ShopAIServiceImpl implements ShopAIService {
             } catch (Exception ex) {
                 conversationHistoryService.addMessage(shopId, customerId, "assistant", aiResponse);
             }
+
+            // Check for cancel order intent in the intent analysis
+            if (!orderCancelled && "CANCELORDER".equals(detectedIntent) && 
+                analysisJson.has("action_required") && analysisJson.get("action_required").asBoolean() &&
+                analysisJson.has("action_details") && customer != null) {
+                
+                JsonNode actionDetails = analysisJson.get("action_details");
+                if (actionDetails.has("action_type") && 
+                    "CANCELORDER".equals(actionDetails.get("action_type").asText())) {
+                    
+                    // Check if order_id is provided
+                    if (actionDetails.has("order_id")) {
+                        try {
+                            // Try to parse order_id as a Long
+                            Long orderId = Long.parseLong(actionDetails.get("order_id").asText());
+                            // Cancel the order
+                            cancelOrderFromAI(orderId);
+                            orderCancelled = true;
+                            log.info("Order cancelled from intent analysis: Order ID: {}", orderId);
+                        } catch (NumberFormatException e) {
+                            log.warn("Invalid order ID format: {}", actionDetails.get("order_id").asText());
+                        }
+                    } else {
+                        // No specific order_id, try to find the most recent order for this customer
+                        Long orderId = findRecentOrderId(customer.getId());
+                        if (orderId != null) {
+                            cancelOrderFromAI(orderId);
+                            orderCancelled = true;
+                            log.info("Most recent order cancelled from intent analysis: Order ID: {}", orderId);
+                        } else {
+                            log.info("No recent order found to cancel for customer ID: {}", customer.getId());
+                        }
+                    }
+                }
+            }
+
+            // Only process order if one hasn't been created yet and this isn't just an address response
+            String fullResponseIntent = aiResponseJson.path("detected_intent").asText("GENERAL_QUERY");
+            
+            // Handle order cancellation if that's the intent
+            if (!orderCancelled && "CANCELORDER".equals(fullResponseIntent) && 
+                aiResponseJson.has("action_required") && 
+                aiResponseJson.get("action_required").asBoolean() &&
+                aiResponseJson.has("action_details") && customer != null) {
+                
+                JsonNode actionDetails = aiResponseJson.get("action_details");
+                if (actionDetails.has("action_type") && 
+                    "CANCELORDER".equals(actionDetails.get("action_type").asText())) {
+                    
+                    // Check if order_id is provided
+                    if (actionDetails.has("order_id")) {
+                        try {
+                            // Try to parse order_id as a Long
+                            Long orderId = Long.parseLong(actionDetails.get("order_id").asText());
+                            // Cancel the order
+                            cancelOrderFromAI(orderId);
+                            orderCancelled = true;
+                            log.info("Order cancelled from full AI response: Order ID: {}", orderId);
+                        } catch (NumberFormatException e) {
+                            log.warn("Invalid order ID format: {}", actionDetails.get("order_id").asText());
+                        }
+                    } else {
+                        // No specific order_id, try to find the most recent order for this customer
+                        Long orderId = findRecentOrderId(customer.getId());
+                        if (orderId != null) {
+                            cancelOrderFromAI(orderId);
+                            orderCancelled = true;
+                            log.info("Most recent order cancelled from full AI response: Order ID: {}", orderId);
+                        } else {
+                            log.info("No recent order found to cancel for customer ID: {}", customer.getId());
+                        }
+                    }
+                }
+            }
+            
             return aiResponse;
         } catch (Exception e) {
             log.error("Error processing customer message with AI: {}", e.getMessage(), e);
@@ -345,7 +664,7 @@ public class ShopAIServiceImpl implements ShopAIService {
         prompt.append("   - Avoid vague or generic responses\n\n");
         
         // CUSTOMER INFORMATION DETECTION (IMPORTANT)
-        prompt.append("CUSTOMER INFORMATION DETECTION (IMPORTANT):\n");
+        prompt.append("CUSTOMER INFORMATION DETECTION (EXTREMELY IMPORTANT):\n");
         prompt.append("1. Look for and detect customer details in messages, including:\n");
         prompt.append("   - Địa chỉ (Addresses): Any text mentioning địa chỉ, nơi ở, chỗ ở, etc.\n");
         prompt.append("   - Họ tên (Full names): Vietnamese full names when customer introduces themselves\n");
@@ -354,6 +673,10 @@ public class ShopAIServiceImpl implements ShopAIService {
         prompt.append("2. When customer provides this information, acknowledge it naturally\n");
         prompt.append("3. If a customer is placing an order and hasn't provided their address yet, ask for it\n");
         prompt.append("4. If you detect customer information, continue the conversation normally\n");
+        prompt.append("5. ALWAYS extract and return any detected address in the 'extracted_address' field\n");
+        prompt.append("6. ALWAYS extract and return any detected phone number in the 'extracted_phone' field\n");
+        prompt.append("7. Example address detection: 'Giao hàng đến số 72 Hương An, Hương Trà, Thừa Thiên Huế nhé' → extracted_address: '72 Hương An, Hương Trà, Thừa Thiên Huế'\n");
+        prompt.append("8. Example phone detection: 'Số điện thoại của mình là 0912345678' → extracted_phone: '0912345678'\n\n");
         
         // Thay thế phần ORDER PROCESSING GUIDELINES cũ
         prompt.append("ORDER PROCESSING GUIDELINES (CRITICAL - FOLLOW EXACTLY):\n");
@@ -367,15 +690,55 @@ public class ShopAIServiceImpl implements ShopAIService {
         prompt.append("4. If product ID cannot be determined, put action_required: false\n");
         prompt.append("5. Always confirm the order details in response_text\n\n");
         
+        // Add new section for order cancellation
+        prompt.append("ORDER CANCELLATION GUIDELINES (CRITICAL - FOLLOW EXACTLY):\n");
+        prompt.append("When handling CANCELORDER intent (customer wants to cancel an order):\n");
+        prompt.append("1. ALWAYS include these fields in action_details:\n");
+        prompt.append("   - action_type: Must be 'CANCELORDER'\n");
+        prompt.append("   - order_id: The specific order ID if mentioned by customer\n");
+        prompt.append("2. If customer doesn't mention a specific order ID, omit the order_id field\n"); 
+        prompt.append("   and the system will cancel their most recent order\n");
+        prompt.append("3. Set action_required: true for all cancellation requests\n");
+        prompt.append("4. Always acknowledge the cancellation request in response_text\n");
+        prompt.append("5. Use empathetic language when confirming cancellations\n\n");
+        
+        // Add example for order cancellation
+        prompt.append("Example - Order Cancellation (CRITICAL):\n");
+        prompt.append("If customer says: 'Tôi muốn hủy đơn hàng số 123'\n");
+        prompt.append("You MUST respond with:\n");
+        prompt.append("{\n");
+        prompt.append("  \"response_text\": \"Vâng, mình sẽ giúp bạn hủy đơn hàng số 123. Yêu cầu hủy đơn hàng đã được xử lý!\",\n");
+        prompt.append("  \"detected_intent\": \"CANCELORDER\",\n");
+        prompt.append("  \"action_required\": true,\n");
+        prompt.append("  \"action_details\": {\n");
+        prompt.append("    \"action_type\": \"CANCELORDER\",\n");
+        prompt.append("    \"order_id\": \"123\"\n");
+        prompt.append("  }\n");
+        prompt.append("}\n\n");
+        
+        // Add example for cancelling most recent order
+        prompt.append("Example - Cancel Most Recent Order (CRITICAL):\n");
+        prompt.append("If customer says: 'Tôi muốn hủy đơn hàng vừa đặt'\n");
+        prompt.append("You MUST respond with:\n");
+        prompt.append("{\n");
+        prompt.append("  \"response_text\": \"Vâng, mình sẽ giúp bạn hủy đơn hàng mới nhất. Yêu cầu hủy đơn hàng đã được xử lý!\",\n");
+        prompt.append("  \"detected_intent\": \"CANCELORDER\",\n");
+        prompt.append("  \"action_required\": true,\n");
+        prompt.append("  \"action_details\": {\n");
+        prompt.append("    \"action_type\": \"CANCELORDER\"\n");
+        prompt.append("  }\n");
+        prompt.append("}\n\n");
+        
         // Thêm ví dụ cho Cocacola
         prompt.append("Example - Specific Order (CRITICAL):\n");
         if (!products.isEmpty()) {
             ProductResponse exampleProduct = products.get(0);
-            prompt.append(String.format("If customer says: 'Mua 2 %s'\n", exampleProduct.getName()));
+            prompt.append(String.format("If customer says: 'Mua 2 %s và giao đến 72 Hương An, Hương Trà, TT Huế'\n", exampleProduct.getName()));
             prompt.append("You MUST respond with:\n");
             prompt.append("{\n");
-            prompt.append(String.format("  \"response_text\": \"Vâng, mình xác nhận đơn hàng 2 %s. Shop sẽ liên hệ bạn sớm!\",\n", exampleProduct.getName()));
+            prompt.append(String.format("  \"response_text\": \"Vâng, mình xác nhận đơn hàng 2 %s. Shop sẽ giao hàng đến địa chỉ 72 Hương An, Hương Trà, TT Huế!\",\n", exampleProduct.getName()));
             prompt.append("  \"detected_intent\": \"PLACEORDER\",\n");
+            prompt.append("  \"extracted_address\": \"72 Hương An, Hương Trà, TT Huế\",\n");
             prompt.append("  \"action_required\": true,\n");
             prompt.append("  \"action_details\": {\n");
             prompt.append("    \"action_type\": \"PLACEORDER\",\n");
@@ -384,11 +747,12 @@ public class ShopAIServiceImpl implements ShopAIService {
             prompt.append("  }\n");
             prompt.append("}\n\n");
         } else {
-            prompt.append("If customer says: 'Mua 2 chai nước'\n");
+            prompt.append("If customer says: 'Mua 2 chai nước và giao đến số 72 đường Hương An'\n");
             prompt.append("You MUST respond with:\n");
             prompt.append("{\n");
-            prompt.append("  \"response_text\": \"Vâng, mình xác nhận đơn hàng 2 chai nước. Shop sẽ liên hệ bạn sớm!\",\n");
+            prompt.append("  \"response_text\": \"Vâng, mình xác nhận đơn hàng 2 chai nước. Shop sẽ giao hàng đến địa chỉ số 72 đường Hương An!\",\n");
             prompt.append("  \"detected_intent\": \"PLACEORDER\",\n");
+            prompt.append("  \"extracted_address\": \"số 72 đường Hương An\",\n");
             prompt.append("  \"action_required\": true,\n");
             prompt.append("  \"action_details\": {\n");
             prompt.append("    \"action_type\": \"PLACEORDER\",\n");
@@ -398,7 +762,7 @@ public class ShopAIServiceImpl implements ShopAIService {
             prompt.append("}\n\n");
         }
         
-        // Thêm danh sách sản phẩm cho việc tra cứu ID
+        // Product reference table and actions
         prompt.append("PRODUCT REFERENCE TABLE - USE FOR ORDER PROCESSING:\n");
         for (ProductResponse product : products) {
             prompt.append(String.format("ID: %d - %s - Price: %s - Category: %s\n", 
@@ -420,7 +784,28 @@ public class ShopAIServiceImpl implements ShopAIService {
         prompt.append("- SENDIMAGE: Send product images directly to customer\n");
         prompt.append("- SHOWPRODUCT: Show product details with image\n");
         prompt.append("- CONVERSATION_REFERENCE: Customer is asking about previous conversation\n");
+        prompt.append("- ADDRESS_RESPONSE: Customer is providing address in response to a request\n");
         prompt.append("- GENERAL_QUERY: General question not fitting other categories\n\n");
+        
+        // Add specific instruction about customer providing address
+        prompt.append("ADDRESS RESPONSE HANDLING (CRITICAL):\n");
+        prompt.append("When a customer is ONLY providing their address in response to your request:\n");
+        prompt.append("1. Use intent 'ADDRESS_RESPONSE' instead of 'PLACEORDER'\n");
+        prompt.append("2. Set action_required to false\n");
+        prompt.append("3. Include the address in extracted_address field\n");
+        prompt.append("4. Confirm receipt of the address in response_text\n");
+        prompt.append("5. Do NOT include action_details for a PLACEORDER action\n\n");
+        
+        // Example for address response
+        prompt.append("Example - Address Response (CRITICAL):\n");
+        prompt.append("If you previously asked for an address and customer says: 'Tôi ở 12 Đường Nguyễn Huệ, Quận 1, TP.HCM'\n");
+        prompt.append("You MUST respond with:\n");
+        prompt.append("{\n");
+        prompt.append("  \"response_text\": \"Cảm ơn bạn, mình đã nhận được địa chỉ: 12 Đường Nguyễn Huệ, Quận 1, TP.HCM. Mình sẽ ghi nhận để giao hàng cho bạn nhé!\",\n");
+        prompt.append("  \"detected_intent\": \"ADDRESS_RESPONSE\",\n");
+        prompt.append("  \"extracted_address\": \"12 Đường Nguyễn Huệ, Quận 1, TP.HCM\",\n");
+        prompt.append("  \"action_required\": false\n");
+        prompt.append("}\n\n");
         
         // Image sending capability
         prompt.append("IMAGE FEATURE (For product visuals):\n");
@@ -477,6 +862,17 @@ public class ShopAIServiceImpl implements ShopAIService {
         prompt.append("Customer: 'Tôi muốn mua áo khoác'\n");
         prompt.append("Assistant: 'Dạ shop mình có nhiều mẫu áo khoác đẹp lắm ạ. Bạn thích phong cách nào? Áo khoác dù, áo khoác da, hay áo khoác len ấm? Mình có thể tư vấn cụ thể hơn cho bạn.'\n\n");
         
+        // Ví dụ 5: Đặt hàng có địa chỉ
+        prompt.append("Example 5 - Order with Address:\n");
+        prompt.append("Customer: 'Tôi muốn mua 2 áo phông size L giao đến 25 Nguyễn Thị Minh Khai, Q.1, TP.HCM'\n");
+        prompt.append("Response: {\n");
+        prompt.append("  \"response_text\": \"Dạ vâng, mình đã xác nhận đơn hàng 2 áo phông size L. Shop sẽ giao hàng đến địa chỉ 25 Nguyễn Thị Minh Khai, Quận 1, TP.HCM cho bạn nhé!\",\n");
+        prompt.append("  \"detected_intent\": \"PLACEORDER\",\n");
+        prompt.append("  \"extracted_address\": \"25 Nguyễn Thị Minh Khai, Quận 1, TP.HCM\",\n");
+        prompt.append("  \"action_required\": true,\n");
+        prompt.append("  \"action_details\": { \"action_type\": \"PLACEORDER\", \"product_id\": 123, \"quantity\": 2 }\n");
+        prompt.append("}\n\n");
+        
         // System requirements for response format
         prompt.append("RESPONSE FORMAT (Must be valid JSON):\n");
         prompt.append("Your response must be in valid JSON format with these fields:\n");
@@ -484,8 +880,10 @@ public class ShopAIServiceImpl implements ShopAIService {
         prompt.append("2. 'detected_intent': The intent category\n");
         prompt.append("3. 'action_required': Boolean indicating if system action is needed\n");
         prompt.append("4. 'action_details': JSON object with details if action_required is true\n");
-        prompt.append("5. 'missing_information': Array of missing data needed\n");
-        prompt.append("6. 'follow_up_questions': Array of suggested questions\n\n");
+        prompt.append("5. 'extracted_address': Any address mentioned by the customer (IMPORTANT FOR ORDERS)\n");
+        prompt.append("6. 'extracted_phone': Any phone number mentioned by the customer\n");
+        prompt.append("7. 'missing_information': Array of missing data needed\n");
+        prompt.append("8. 'follow_up_questions': Array of suggested questions\n\n");
         
         // Customer message
         prompt.append("CURRENT CUSTOMER MESSAGE: \"").append(message).append("\"\n");
@@ -636,12 +1034,23 @@ public class ShopAIServiceImpl implements ShopAIService {
                 .add("SENDIMAGE")
                 .add("SHOWPRODUCT")
                 .add("CONVERSATION_REFERENCE")
+                .add("ADDRESS_RESPONSE")
                 .add("GENERAL_QUERY");
             detectedIntent.set("enum", allowedIntents);
             
             ObjectNode actionRequired = properties.putObject("action_required");
             actionRequired.put("type", "BOOLEAN");
             actionRequired.put("description", "Whether the system needs to take an action based on this message");
+            
+            // Add extracted address property
+            ObjectNode extractedAddress = properties.putObject("extracted_address");
+            extractedAddress.put("type", "STRING");
+            extractedAddress.put("description", "Any delivery address mentioned by the customer, in full detail");
+            
+            // Add extracted phone property
+            ObjectNode extractedPhone = properties.putObject("extracted_phone");
+            extractedPhone.put("type", "STRING");
+            extractedPhone.put("description", "Any phone number mentioned by the customer");
             
             // Define action_details with properties
             ObjectNode actionDetails = properties.putObject("action_details");
@@ -694,7 +1103,7 @@ public class ShopAIServiceImpl implements ShopAIService {
             // Add order_id property
             ObjectNode orderId = actionDetailsProperties.putObject("order_id");
             orderId.put("type", "STRING");
-            orderId.put("description", "Order ID when referencing a specific order");
+            orderId.put("description", "Order ID when referencing a specific order, especially for CANCELORDER intent. Omit for cancelling most recent order.");
             
             // Add send_product_images property
             ObjectNode sendProductImages = actionDetailsProperties.putObject("send_product_images");
@@ -1096,6 +1505,27 @@ public class ShopAIServiceImpl implements ShopAIService {
             
             StringBuilder prompt = new StringBuilder();
             
+            // Check if the last assistant message was asking for address
+            boolean lastMessageWasAddressRequest = false;
+            String previousAssistantMessage = "";
+            
+            if (history != null && history.size() > 1) {
+                // Look at the most recent assistant message
+                for (int i = history.size() - 2; i >= 0; i--) {
+                    ConversationHistoryService.ConversationEntry entry = history.get(i);
+                    if ("assistant".equals(entry.role)) {
+                        previousAssistantMessage = entry.message.toLowerCase();
+                        if (previousAssistantMessage.contains("địa chỉ") || 
+                            previousAssistantMessage.contains("giao đến đâu") || 
+                            previousAssistantMessage.contains("giao hàng") || 
+                            previousAssistantMessage.contains("gửi đến đâu")) {
+                            lastMessageWasAddressRequest = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            
             // Thêm lịch sử hội thoại vào phân tích intent
             if (history != null && !history.isEmpty()) {
                 prompt.append("Recent conversation history:\n");
@@ -1117,6 +1547,13 @@ public class ShopAIServiceImpl implements ShopAIService {
                   
             prompt.append("Determine the intent and whether shop product context is needed to properly respond.\n\n");
             
+            // Add specific instruction for address responses
+            if (lastMessageWasAddressRequest) {
+                prompt.append("IMPORTANT: If this message is ONLY providing an address in response to a previous question, ");
+                prompt.append("set the detected_intent to 'ADDRESS_RESPONSE' instead of 'PLACEORDER'. ");
+                prompt.append("When the intent is ADDRESS_RESPONSE, set action_required to false.\n\n");
+            }
+            
             prompt.append("IMPORTANT: Standard action codes to use:\n");
             prompt.append("- GREETING: Simple greeting or welcome message\n");
             prompt.append("- GETPRODUCT: Get detailed information about a specific product\n");
@@ -1128,13 +1565,31 @@ public class ShopAIServiceImpl implements ShopAIService {
             prompt.append("- SENDIMAGE: Send product images directly to customer\n");
             prompt.append("- SHOWPRODUCT: Show product details with image\n");
             prompt.append("- CONVERSATION_REFERENCE: Customer is asking about previous conversation\n");
+            prompt.append("- ADDRESS_RESPONSE: Customer is providing their address in response to a request\n");
             prompt.append("- GENERAL_QUERY: General question not fitting other categories\n\n");
             
-            prompt.append("IMPORTANT: When the customer asks to see product images or product details, always prefer to use:\n");
+            // Add specific instructions for ORDER CANCELLATION intent detection
+            prompt.append("IMPORTANT CANCELORDER DETECTION GUIDELINES:\n");
+            prompt.append("1. Use CANCELORDER intent when messages include phrases like:\n");
+            prompt.append("   - 'hủy đơn hàng', 'hủy đơn', 'không mua nữa'\n");
+            prompt.append("   - 'huỷ giao dịch', 'không đặt hàng nữa', 'không muốn mua nữa'\n");
+            prompt.append("   - 'cancel order', 'cancel my order', 'don't want to buy anymore'\n");
+            prompt.append("2. If the customer mentions a specific order ID ('đơn hàng số X', 'mã đơn hàng X'):\n");
+            prompt.append("   - Include the 'order_id' field with the exact order number\n");
+            prompt.append("3. If no order ID is mentioned, do NOT include the 'order_id' field\n");
+            prompt.append("4. Set action_required: true for all cancellation requests\n");
+            prompt.append("5. Always provide a clear confirmation in response_text\n\n");
+            
+            prompt.append("IMPORTANT: When customer asks about product images or product details, always prefer to use:\n");
             prompt.append("- SENDIMAGE: For sending multiple product images directly\n");
             prompt.append("- SHOWPRODUCT: For showing detailed product information with image\n\n");
             
             prompt.append("IMPORTANT: When customer asks about previous messages or what they asked before, use CONVERSATION_REFERENCE\n\n");
+            
+            prompt.append("IMPORTANT: Always look for and extract delivery information when customer may provide it:\n");
+            prompt.append("1. Look for addresses: Any text related to addresses, delivery locations, house numbers, streets, etc.\n");
+            prompt.append("2. Look for phone numbers: Vietnamese phone numbers in formats like 0912345678, +84912345678, etc.\n");
+            prompt.append("3. Include the extracted information in extracted_address and extracted_phone fields.\n\n");
             
             prompt.append("IMPORTANT: Keep your response_text short, natural, conversational, and human-like. ");
             prompt.append("Always respond in Vietnamese unless the customer uses English. ");
@@ -1178,6 +1633,7 @@ public class ShopAIServiceImpl implements ShopAIService {
                 .add("SENDIMAGE")
                 .add("SHOWPRODUCT")
                 .add("CONVERSATION_REFERENCE")
+                .add("ADDRESS_RESPONSE")
                 .add("GENERAL_QUERY");
             detectedIntent.set("enum", allowedIntents);
             
@@ -1186,6 +1642,16 @@ public class ShopAIServiceImpl implements ShopAIService {
             
             ObjectNode actionRequired = properties.putObject("action_required");
             actionRequired.put("type", "BOOLEAN");
+            
+            // Add extracted_address property
+            ObjectNode extractedAddress = properties.putObject("extracted_address");
+            extractedAddress.put("type", "STRING");
+            extractedAddress.put("description", "Address extracted from the customer message, if any");
+            
+            // Add extracted_phone property
+            ObjectNode extractedPhone = properties.putObject("extracted_phone");
+            extractedPhone.put("type", "STRING");
+            extractedPhone.put("description", "Phone number extracted from the customer message, if any");
             
             // Add follow-up questions array property
             ObjectNode followUpQuestions = properties.putObject("follow_up_questions");
@@ -1241,6 +1707,57 @@ public class ShopAIServiceImpl implements ShopAIService {
             log.error("Error analyzing message intent: {}", e.getMessage(), e);
             return createErrorResponse("Error analyzing message: " + e.getMessage());
         }
+    }
+    
+    /**
+     * Checks if the message is likely just providing an address in response to a request
+     */
+    private boolean isProbablyAddressOnly(String message, List<ConversationHistoryService.ConversationEntry> history) {
+        if (message == null || message.isEmpty()) {
+            return false;
+        }
+        
+        // Most address-only messages are short and contain location indicators
+        boolean messageContainsAddressIndicators = message.contains("số") || 
+                                                 message.contains("đường") || 
+                                                 message.contains("phố") || 
+                                                 message.contains("quận") || 
+                                                 message.contains("phường") || 
+                                                 message.contains("tỉnh") || 
+                                                 message.contains("thành phố") || 
+                                                 message.contains("tp") || 
+                                                 message.contains("huyện") || 
+                                                 message.contains("xã");
+        
+        // Check if there are product mentions or quantity indicators that would suggest an order
+        boolean containsOrderLanguage = message.toLowerCase().contains("đặt") || 
+                                      message.toLowerCase().contains("mua") || 
+                                      message.toLowerCase().contains("order") || 
+                                      message.matches(".*\\d+\\s*(cái|lon|chai|hộp|gói|kg|gram|g).*");
+        
+        // If no order language but has address indicators, it might be address-only
+        if (messageContainsAddressIndicators && !containsOrderLanguage) {
+            return true;
+        }
+        
+        // Check if previous assistant message was asking for address
+        if (history != null && history.size() > 1) {
+            for (int i = history.size() - 2; i >= 0; i--) {
+                ConversationHistoryService.ConversationEntry entry = history.get(i);
+                if ("assistant".equals(entry.role)) {
+                    String previousMessage = entry.message.toLowerCase();
+                    if (previousMessage.contains("địa chỉ") || 
+                        previousMessage.contains("giao đến đâu") || 
+                        previousMessage.contains("giao hàng") || 
+                        previousMessage.contains("gửi đến đâu")) {
+                        return true;
+                    }
+                    break;
+                }
+            }
+        }
+        
+        return false;
     }
 
     /**
@@ -1369,6 +1886,159 @@ public class ShopAIServiceImpl implements ShopAIService {
         } catch (Exception e) {
             log.error("Error checking missing customer address: {}", e.getMessage(), e);
             return null; // Continue with normal processing if this fails
+        }
+    }
+
+    /**
+     * Save an order based on AI conversation
+     * @param customerId Customer ID
+     * @param productId Product ID
+     * @param quantity Quantity of the product to order
+     * @return The created OrderDTO
+     */
+    private OrderDTO saveOrderFromAI(Long customerId, Long productId, int quantity) {
+        CreateOrderRequest orderRequest = CreateOrderRequest.builder()
+                .customerId(customerId)
+                .productId(productId)
+                .quantity(quantity)
+                .note("Đơn hàng được tạo qua AI Assistant")
+                .deliveryUnit("Chưa xác định")
+                .build();
+                
+        // Call the order service to create the order
+        OrderDTO createdOrder = orderService.createOrder(orderRequest);
+        return createdOrder;
+    }
+
+    /**
+     * Extract address information from the customer message
+     * @param message The customer message
+     * @return Extracted address or null if not found
+     */
+    private String extractAddressFromMessage(String message) {
+        if (message == null || message.isEmpty()) {
+            return null;
+        }
+        
+        // Look for common Vietnamese address patterns
+        // Pattern 1: Anything following "địa chỉ", "address", "giao hàng đến", etc.
+        String lowerMessage = message.toLowerCase();
+        String[] addressIndicators = {"địa chỉ", "address", "giao hàng đến", "giao đến", "gửi đến", "gửi hàng đến", "ship đến", "nhà mình", "chỗ mình"};
+        
+        for (String indicator : addressIndicators) {
+            int index = lowerMessage.indexOf(indicator);
+            if (index >= 0) {
+                // Extract from the indicator to the end or next punctuation
+                String addressPart = message.substring(index + indicator.length()).trim();
+                
+                // Remove leading punctuation like ":", "là", etc.
+                addressPart = addressPart.replaceAll("^[\\s:,;là]*", "").trim();
+                
+                // Take until the end of the sentence or next paragraph
+                int endIndex = -1;
+                for (String endMark : new String[]{".", "\n", "\r"}) {
+                    int tempIndex = addressPart.indexOf(endMark);
+                    if (tempIndex > 0 && (endIndex == -1 || tempIndex < endIndex)) {
+                        endIndex = tempIndex;
+                    }
+                }
+                
+                if (endIndex > 0) {
+                    addressPart = addressPart.substring(0, endIndex).trim();
+                }
+                
+                if (!addressPart.isEmpty() && addressPart.length() >= 5) {
+                    return addressPart;
+                }
+            }
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Extract phone number from the customer message
+     * @param message The customer message
+     * @return Extracted phone number or null if not found
+     */
+    private String extractPhoneFromMessage(String message) {
+        if (message == null || message.isEmpty()) {
+            return null;
+        }
+        
+        // Regular expression for Vietnamese phone numbers
+        // Pattern covers formats like: 0912345678, 84912345678, +84912345678
+        String phonePattern = "\\b((\\+84|84|0)\\d{9,10})\\b";
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(phonePattern);
+        java.util.regex.Matcher matcher = pattern.matcher(message);
+        
+        if (matcher.find()) {
+            String phone = matcher.group(1);
+            
+            // Normalize phone format to start with 0
+            if (phone.startsWith("+84")) {
+                phone = "0" + phone.substring(3);
+            } else if (phone.startsWith("84")) {
+                phone = "0" + phone.substring(2);
+            }
+            
+            return phone;
+        }
+        
+        return null;
+    }
+
+    /**
+     * Cancel an order based on AI conversation
+     * @param orderId Order ID to cancel
+     * @return The cancelled order DTO
+     */
+    private OrderDTO cancelOrderFromAI(Long orderId) {
+        try {
+            // Create a request to update the order status to CANCELLED
+            UpdateOrderStatusRequest request = UpdateOrderStatusRequest.builder()
+                    .status(OrderStatus.CANCELLED)
+                    .build();
+                    
+            // Call the order service to update the order status
+            OrderDTO cancelledOrder = orderService.updateOrderStatus(orderId, request);
+            return cancelledOrder;
+        } catch (Exception e) {
+            log.error("Error cancelling order from AI: {}", e.getMessage(), e);
+            return null;
+        }
+    }
+    
+    /**
+     * Find the most recent order ID for a customer
+     * @param customerId Customer ID
+     * @return The most recent order ID or null if none found
+     */
+    private Long findRecentOrderId(Long customerId) {
+        try {
+            // Get the most recent orders for this customer
+            List<OrderDTO> customerOrders = orderService.getOrdersByCustomerId(customerId);
+            
+            if (customerOrders != null && !customerOrders.isEmpty()) {
+                // Sort by created date in descending order (most recent first)
+                customerOrders.sort((o1, o2) -> {
+                    LocalDateTime date1 = o1.getCreatedAt();
+                    LocalDateTime date2 = o2.getCreatedAt();
+                    return date2.compareTo(date1); // Descending order
+                });
+                
+                // Return the ID of the most recent order that's not already cancelled
+                for (OrderDTO order : customerOrders) {
+                    if (order.getStatus() != OrderStatus.CANCELLED) {
+                        return order.getId();
+                    }
+                }
+            }
+            
+            return null; // No valid orders found
+        } catch (Exception e) {
+            log.error("Error finding recent order for customer: {}", e.getMessage(), e);
+            return null;
         }
     }
 } 
