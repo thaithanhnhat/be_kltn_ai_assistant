@@ -34,10 +34,17 @@ spring:
             enable: true
   # Flyway configuration for database migrations
   flyway:
-    enabled: true
+    enabled: false
     baseline-on-migrate: true
     locations: classpath:db/migration
     validate-on-migrate: true
+
+# Logging configuration
+logging:
+  level:
+    root: INFO
+    com.g18.assistant.service.impl.ShopAIServiceImpl: DEBUG
+    org.springframework.web.client.RestTemplate: DEBUG
 
 # Application specific settings
 app:
@@ -55,9 +62,27 @@ app:
     # Secret key for signing the JWT tokens
     secret: yrU537DGFdf743hgfKJHGF8743hgDFG9876HGDF7846hgKJHGD7846hfH
     # Access token expiration time in milliseconds (15 minutes)
-    access-token-expiration: 900000
+    access-token-expiration: 604800000
     # Refresh token expiration time in milliseconds (7 days)
     refresh-token-expiration: 604800000
+
+  # Gemini AI Configuration
+  gemini:
+    api-key: ${GEMINI_API_KEY:AIzaSyB1EYnFlDSgFhqv3Kk4FDv1ukZvl4H7wBY}
+    # Model for image generation
+    model-id: gemini-2.0-flash-exp-image-generation
+    # Model for chat interactions - updated to latest model that handles structured outputs well
+    chat-model-id: gemini-2.5-flash-preview-04-17
+    api-url: https://generativelanguage.googleapis.com/v1beta/models
+
+  # Facebook Bot Configuration
+  facebook:
+    api:
+      url: https://graph.facebook.com/v18.0
+  
+  # Base URL for webhooks
+  base:
+    url: ${BASE_URL:http://localhost:8080/assistant}
 
   # BNB Testnet settings
   bnb:
@@ -70,4 +95,14 @@ app:
     
   # Exchange rate settings
   exchange-rate:
-    usd-to-vnd: ${USD_TO_VND_RATE:26000}  # 1 USD = 26,000 VND 
+    usd-to-vnd: ${USD_TO_VND_RATE:26000}  # 1 USD = 26,000 VND
+
+# VNPAY Configuration
+vnpay:
+  version: 2.1.0
+  tmnCode: 5SGAW8CS
+  hashSecret: 4WG189P4KMM9CGLQLJUFCKL866XXU9SV
+  paymentUrl: https://sandbox.vnpayment.vn/paymentv2/vpcpay.html
+  returnUrl: http://localhost:5173/payment/result
+  returnIPNUrl: http://localhost:5173/api/vnpay/ipn
+  timezone: Asia/Ho_Chi_Minh
