@@ -59,6 +59,9 @@ public class ShopAIServiceImpl implements ShopAIService {
     @Value("${app.gemini.api-url}")
     private String geminiApiUrl;
     
+    // Add a map to track pending orders that need address information
+    private final Map<String, Map<String, Object>> pendingOrders = new ConcurrentHashMap<>();
+    
     @Override
     public String processCustomerMessage(Long shopId, String customerId, String customerName, String message) {
         try {
@@ -142,6 +145,10 @@ public class ShopAIServiceImpl implements ShopAIService {
             // Format history string
             String historyStr = formatConversationHistory(history);
             
+            // Check if there's a pending order for this customer
+            String customerKey = shopId + ":" + customerId;
+            Map<String, Object> pendingOrder = pendingOrders.get(customerKey);
+            
             // Check if this message is likely just providing an address (quick check before AI call)
             boolean isLikelyAddressOnly = isProbablyAddressOnly(message, history);
 
@@ -187,15 +194,99 @@ public class ShopAIServiceImpl implements ShopAIService {
             
             String detectedIntent = analysisJson.path("detected_intent").asText("GENERAL_QUERY");
             
-            // Special handling for ADDRESS_RESPONSE intent - never process as an order
-            if ("ADDRESS_RESPONSE".equals(detectedIntent)) {
-                log.info("Detected ADDRESS_RESPONSE intent, will only update customer information with address");
+            // Handle ADDRESS_RESPONSE with create_order field
+            if ("ADDRESS_RESPONSE".equals(detectedIntent) && customer != null) {
+                log.info("Processing address response with potential order creation");
                 
-                // If this is just an address response, just process the AI response
-                // without trying to create any orders from it
+                boolean createOrder = analysisJson.path("create_order").asBoolean(false);
+                boolean actionRequired = analysisJson.path("action_required").asBoolean(false);
+                
+                // Check if we should create an order from explicit action_details
+                if (actionRequired && analysisJson.has("action_details") && 
+                    analysisJson.path("action_details").has("action_type") &&
+                    "PLACEORDER".equals(analysisJson.path("action_details").path("action_type").asText()) &&
+                    analysisJson.path("action_details").has("product_id") && 
+                    analysisJson.path("action_details").has("quantity")) {
+                    
+                    JsonNode actionDetails = analysisJson.get("action_details");
+                    Long productId = actionDetails.get("product_id").asLong();
+                    int quantity = actionDetails.get("quantity").asInt();
+                    
+                    // Check if we have a valid address now
+                    boolean hasValidAddress = extractedAddress != null || 
+                                             (customer.getAddress() != null && 
+                                              !customer.getAddress().isEmpty() && 
+                                              !customer.getAddress().equals("Đang cập nhật"));
+                    
+                    if (hasValidAddress && !orderCreated) {
+                        // Create the order directly from the address response
+                        saveOrderFromAI(customer.getId(), productId, quantity);
+                        orderCreated = true;
+                        log.info("Created order directly from address response with PLACEORDER action: Product ID: {}, Quantity: {}", 
+                                productId, quantity);
+                                
+                        // Remove any pending orders
+                        pendingOrders.remove(customerKey);
+                        
+                        // We can return the response immediately since we've processed the order
+                        return intentAnalysis;
+                    }
+                }
+                // Fallback to the create_order flag (may be used in future responses)
+                else if (createOrder && actionRequired && analysisJson.has("action_details") && 
+                    analysisJson.path("action_details").has("product_id") && 
+                    analysisJson.path("action_details").has("quantity")) {
+                    
+                    JsonNode actionDetails = analysisJson.get("action_details");
+                    Long productId = actionDetails.get("product_id").asLong();
+                    int quantity = actionDetails.get("quantity").asInt();
+                    
+                    // Check if we have a valid address now
+                    boolean hasValidAddress = extractedAddress != null || 
+                                             (customer.getAddress() != null && 
+                                              !customer.getAddress().isEmpty() && 
+                                              !customer.getAddress().equals("Đang cập nhật"));
+                    
+                    if (hasValidAddress && !orderCreated) {
+                        // Create the order directly from the address response
+                        saveOrderFromAI(customer.getId(), productId, quantity);
+                        orderCreated = true;
+                        log.info("Created order directly from address response with create_order field: Product ID: {}, Quantity: {}", 
+                                productId, quantity);
+                                
+                        // Remove any pending orders
+                        pendingOrders.remove(customerKey);
+                        
+                        // We can return the response immediately since we've processed the order
+                        return intentAnalysis;
+                    }
+                } else if (pendingOrder != null) {
+                    // If no explicit create_order field but we have a pending order, use that
+                    Long productId = ((Number) pendingOrder.get("productId")).longValue();
+                    int quantity = ((Number) pendingOrder.get("quantity")).intValue();
+                    
+                    // Check if we have a valid address now
+                    boolean hasValidAddress = extractedAddress != null || 
+                                             (customer.getAddress() != null && 
+                                              !customer.getAddress().isEmpty() && 
+                                              !customer.getAddress().equals("Đang cập nhật"));
+                    
+                    if (hasValidAddress && !orderCreated) {
+                        // Create the order using the pending information
+                        saveOrderFromAI(customer.getId(), productId, quantity);
+                        orderCreated = true;
+                        log.info("Created order from pending request after address response: Product ID: {}, Quantity: {}", 
+                                productId, quantity);
+                        
+                        // Remove the pending order
+                        pendingOrders.remove(customerKey);
+                    }
+                }
+                
+                // If this is just an address response, return immediately
                 boolean needsShopContext = analysisJson.path("needs_shop_context").asBoolean(false);
                 if (!needsShopContext) {
-                    log.info("Simple address response detected, returning without any order processing");
+                    log.info("Returning address response without further processing");
                     return intentAnalysis;
                 }
             }
@@ -208,57 +299,94 @@ public class ShopAIServiceImpl implements ShopAIService {
                 }
             }
             
-            // Skip order processing for likely address-only messages or ADDRESS_RESPONSE intent
-            if (!isLikelyAddressOnly && !"ADDRESS_RESPONSE".equals(detectedIntent)) {
-                // Process order from initial intent analysis only if it has all required information
-                // and we're handling a simple query that doesn't need full shop context
-                if (!orderCreated && "PLACEORDER".equals(detectedIntent) && 
-                    analysisJson.has("action_required") && analysisJson.get("action_required").asBoolean() &&
-                    analysisJson.has("action_details") && customer != null) {
-                    
-                    // First, check if address is listed as missing information
-                    boolean addressIsMissing = false;
-                    if (analysisJson.has("missing_information") && analysisJson.get("missing_information").isArray()) {
-                        JsonNode missingInfoArray = analysisJson.get("missing_information");
-                        for (JsonNode item : missingInfoArray) {
-                            String missingItem = item.asText();
-                            if (missingItem.contains("address") || missingItem.contains("địa chỉ") || 
-                                missingItem.equals("delivery_address") || missingItem.equals("shipping_address")) {
-                                addressIsMissing = true;
-                                log.info("Not creating order yet because address is listed as missing information");
-                                break;
-                            }
-                        }
-                    }
-                    
-                    // Only proceed if address is not listed as missing
-                    if (!addressIsMissing) {
-                        JsonNode actionDetails = analysisJson.get("action_details");
-                        if (actionDetails.has("action_type") && 
-                            "PLACEORDER".equals(actionDetails.get("action_type").asText()) && 
-                            actionDetails.has("product_id") && actionDetails.has("quantity")) {
-                            
-                            Long productId = actionDetails.get("product_id").asLong();
-                            int quantity = actionDetails.get("quantity").asInt();
-                            
-                            // Only attempt to place order if we have the required address
-                            if (extractedAddress != null || 
-                                (customer.getAddress() != null && !customer.getAddress().isEmpty() && 
-                                 !customer.getAddress().equals("Đang cập nhật"))) {
-                                
-                                // Save the order
-                                saveOrderFromAI(customer.getId(), productId, quantity);
-                                orderCreated = true;
-                                log.info("Order created from intent analysis: Product ID: {}, Quantity: {}", 
-                                        productId, quantity);
-                            } else {
-                                log.info("Not creating order yet because no address is available");
-                            }
+            // Check if we should store information about a pending order
+            if ("PLACEORDER".equals(detectedIntent) && 
+                analysisJson.has("action_required") && 
+                analysisJson.get("action_required").asBoolean() &&
+                analysisJson.has("action_details") && 
+                analysisJson.path("action_details").has("product_id") && 
+                analysisJson.path("action_details").has("quantity")) {
+                
+                JsonNode actionDetails = analysisJson.get("action_details");
+                Long productId = actionDetails.get("product_id").asLong();
+                int quantity = actionDetails.get("quantity").asInt();
+                
+                // Check if address is missing
+                boolean needsAddress = customer == null || 
+                    customer.getAddress() == null || 
+                    customer.getAddress().isEmpty() || 
+                    customer.getAddress().equals("Đang cập nhật");
+                
+                if (needsAddress && !orderCreated) {
+                    // Store pending order details
+                    Map<String, Object> orderDetails = new HashMap<>();
+                    orderDetails.put("productId", productId);
+                    orderDetails.put("quantity", quantity);
+                    orderDetails.put("timestamp", System.currentTimeMillis());
+                    pendingOrders.put(customerKey, orderDetails);
+                    log.info("Stored pending order for customer {}: Product ID: {}, Quantity: {}", 
+                           customerKey, productId, quantity);
+                }
+            }
+            
+            // Process order from initial intent analysis only if it has all required information
+            // and we're handling a simple query that doesn't need full shop context
+            if (!orderCreated && "PLACEORDER".equals(detectedIntent) && 
+                analysisJson.has("action_required") && analysisJson.get("action_required").asBoolean() &&
+                analysisJson.has("action_details") && customer != null) {
+                
+                // First, check if address is listed as missing information
+                boolean addressIsMissing = false;
+                if (analysisJson.has("missing_information") && analysisJson.get("missing_information").isArray()) {
+                    JsonNode missingInfoArray = analysisJson.get("missing_information");
+                    for (JsonNode item : missingInfoArray) {
+                        String missingItem = item.asText();
+                        if (missingItem.contains("address") || missingItem.contains("địa chỉ") || 
+                            missingItem.equals("delivery_address") || missingItem.equals("shipping_address")) {
+                            addressIsMissing = true;
+                            log.info("Not creating order yet because address is listed as missing information");
+                            break;
                         }
                     }
                 }
-            } else {
-                log.info("Skipping initial order processing for likely address-only message");
+                
+                // Only proceed if address is not listed as missing
+                if (!addressIsMissing) {
+                    JsonNode actionDetails = analysisJson.get("action_details");
+                    if (actionDetails.has("action_type") && 
+                        "PLACEORDER".equals(actionDetails.get("action_type").asText()) && 
+                        actionDetails.has("product_id") && actionDetails.has("quantity")) {
+                        
+                        Long productId = actionDetails.get("product_id").asLong();
+                        int quantity = actionDetails.get("quantity").asInt();
+                        
+                        // Only attempt to place order if we have the required address
+                        if (extractedAddress != null || 
+                            (customer.getAddress() != null && !customer.getAddress().isEmpty() && 
+                             !customer.getAddress().equals("Đang cập nhật"))) {
+                            
+                            // Save the order
+                            saveOrderFromAI(customer.getId(), productId, quantity);
+                            orderCreated = true;
+                            log.info("Order created from intent analysis: Product ID: {}, Quantity: {}", 
+                                    productId, quantity);
+                            
+                            // Clear any pending orders
+                            pendingOrders.remove(customerKey);
+                        } else {
+                            log.info("Not creating order yet because no address is available");
+                            
+                            // Store this as a pending order
+                            Map<String, Object> orderDetails = new HashMap<>();
+                            orderDetails.put("productId", productId);
+                            orderDetails.put("quantity", quantity);
+                            orderDetails.put("timestamp", System.currentTimeMillis());
+                            pendingOrders.put(customerKey, orderDetails);
+                            log.info("Stored pending order for customer {}: Product ID: {}, Quantity: {}", 
+                                   customerKey, productId, quantity);
+                        }
+                    }
+                }
             }
             
             boolean needsShopContext = analysisJson.path("needs_shop_context").asBoolean(false);
@@ -313,11 +441,93 @@ public class ShopAIServiceImpl implements ShopAIService {
                     }
                 }
                 
-                // Only process order if one hasn't been created yet and this isn't just an address response
+                // Get the full response intent
                 String fullResponseIntent = aiResponseJson.path("detected_intent").asText("GENERAL_QUERY");
+                
+                // Handle ADDRESS_RESPONSE with create_order in full AI response
+                if ("ADDRESS_RESPONSE".equals(fullResponseIntent) && customer != null && !orderCreated) {
+                    boolean createOrder = aiResponseJson.path("create_order").asBoolean(false);
+                    boolean actionRequired = aiResponseJson.path("action_required").asBoolean(false);
+                    
+                    // Check if we should create an order from explicit action_details
+                    if (actionRequired && aiResponseJson.has("action_details") && 
+                        aiResponseJson.path("action_details").has("action_type") &&
+                        "PLACEORDER".equals(aiResponseJson.path("action_details").path("action_type").asText()) &&
+                        aiResponseJson.path("action_details").has("product_id") && 
+                        aiResponseJson.path("action_details").has("quantity")) {
+                        
+                        JsonNode actionDetails = aiResponseJson.get("action_details");
+                        Long productId = actionDetails.get("product_id").asLong();
+                        int quantity = actionDetails.get("quantity").asInt();
+                        
+                        // Check if we have a valid address now
+                        boolean hasValidAddress = extractedAddress != null || 
+                                                (customer.getAddress() != null && 
+                                                !customer.getAddress().isEmpty() && 
+                                                !customer.getAddress().equals("Đang cập nhật"));
+                        
+                        if (hasValidAddress) {
+                            // Create the order directly from the address response
+                            saveOrderFromAI(customer.getId(), productId, quantity);
+                            orderCreated = true;
+                            log.info("Created order from full AI address response with PLACEORDER action: Product ID: {}, Quantity: {}", 
+                                    productId, quantity);
+                                    
+                            // Remove any pending orders
+                            pendingOrders.remove(customerKey);
+                        }
+                    }
+                    // Fallback to the create_order flag (may be used in future responses)
+                    else if (createOrder && actionRequired && aiResponseJson.has("action_details") && 
+                        aiResponseJson.path("action_details").has("product_id") && 
+                        aiResponseJson.path("action_details").has("quantity")) {
+                        
+                        JsonNode actionDetails = aiResponseJson.get("action_details");
+                        Long productId = actionDetails.get("product_id").asLong();
+                        int quantity = actionDetails.get("quantity").asInt();
+                        
+                        // Check if we have a valid address now
+                        boolean hasValidAddress = extractedAddress != null || 
+                                                (customer.getAddress() != null && 
+                                                !customer.getAddress().isEmpty() && 
+                                                !customer.getAddress().equals("Đang cập nhật"));
+                        
+                        if (hasValidAddress) {
+                            // Create the order directly from the address response
+                            saveOrderFromAI(customer.getId(), productId, quantity);
+                            orderCreated = true;
+                            log.info("Created order from full AI address response with create_order: Product ID: {}, Quantity: {}", 
+                                    productId, quantity);
+                                    
+                            // Remove any pending orders
+                            pendingOrders.remove(customerKey);
+                        }
+                    } else if (pendingOrder != null) {
+                        // If no explicit create_order field but we have a pending order, use that
+                        Long productId = ((Number) pendingOrder.get("productId")).longValue();
+                        int quantity = ((Number) pendingOrder.get("quantity")).intValue();
+                        
+                        // Check if we have a valid address now
+                        boolean hasValidAddress = extractedAddress != null || 
+                                                (customer.getAddress() != null && 
+                                                !customer.getAddress().isEmpty() && 
+                                                !customer.getAddress().equals("Đang cập nhật"));
+                        
+                        if (hasValidAddress) {
+                            // Create the order using the pending information
+                            saveOrderFromAI(customer.getId(), productId, quantity);
+                            orderCreated = true;
+                            log.info("Created order from pending request after full AI address response: Product ID: {}, Quantity: {}", 
+                                    productId, quantity);
+                            
+                            // Remove the pending order
+                            pendingOrders.remove(customerKey);
+                        }
+                    }
+                }
+                
+                // Only process order if one hasn't been created yet and this isn't just an address response
                 if (!orderCreated && 
-                    !isLikelyAddressOnly && 
-                    !"ADDRESS_RESPONSE".equals(fullResponseIntent) &&
                     "PLACEORDER".equals(fullResponseIntent) && 
                     aiResponseJson.has("action_required") && 
                     aiResponseJson.get("action_required").asBoolean() &&
@@ -391,13 +601,23 @@ public class ShopAIServiceImpl implements ShopAIService {
                                 
                                 log.info("Order saved successfully from AI response: Product ID: {}, Quantity: {}, Customer ID: {}", 
                                         productId, quantity, customer.getId());
+                                
+                                // Clear any pending orders
+                                pendingOrders.remove(customerKey);
                             } else {
                                 log.info("Not creating order because no valid address is available");
+                                
+                                // Store as pending order
+                                Map<String, Object> orderDetails = new HashMap<>();
+                                orderDetails.put("productId", productId);
+                                orderDetails.put("quantity", quantity);
+                                orderDetails.put("timestamp", System.currentTimeMillis());
+                                pendingOrders.put(customerKey, orderDetails);
+                                log.info("Stored pending order from full AI for customer {}: Product ID: {}, Quantity: {}", 
+                                       customerKey, productId, quantity);
                             }
                         }
                     }
-                } else if (isLikelyAddressOnly || "ADDRESS_RESPONSE".equals(fullResponseIntent)) {
-                    log.info("Skipping order processing for address-only message");
                 }
             } catch (Exception ex) {
                 log.error("Error processing AI response for order creation: {}", ex.getMessage(), ex);
@@ -791,20 +1011,42 @@ public class ShopAIServiceImpl implements ShopAIService {
         prompt.append("ADDRESS RESPONSE HANDLING (CRITICAL):\n");
         prompt.append("When a customer is ONLY providing their address in response to your request:\n");
         prompt.append("1. Use intent 'ADDRESS_RESPONSE' instead of 'PLACEORDER'\n");
-        prompt.append("2. Set action_required to false\n");
+        prompt.append("2. Set action_required to true\n");
         prompt.append("3. Include the address in extracted_address field\n");
         prompt.append("4. Confirm receipt of the address in response_text\n");
-        prompt.append("5. Do NOT include action_details for a PLACEORDER action\n\n");
+        prompt.append("5. Add create_order: true if this address is for an order that should be created immediately\n");
+        prompt.append("6. Include complete order details in action_details:\n");
+        prompt.append("   - action_type: 'PLACEORDER'\n");
+        prompt.append("   - product_id: The ID of the product to order\n");
+        prompt.append("   - quantity: The quantity to order\n\n");
         
         // Example for address response
-        prompt.append("Example - Address Response (CRITICAL):\n");
-        prompt.append("If you previously asked for an address and customer says: 'Tôi ở 12 Đường Nguyễn Huệ, Quận 1, TP.HCM'\n");
+        prompt.append("Example - Address Response with Order (CRITICAL):\n");
+        prompt.append("If you previously asked for an address for a Cocacola order and customer says: 'Tôi ở 12 Đường Nguyễn Huệ, Quận 1, TP.HCM'\n");
         prompt.append("You MUST respond with:\n");
         prompt.append("{\n");
-        prompt.append("  \"response_text\": \"Cảm ơn bạn, mình đã nhận được địa chỉ: 12 Đường Nguyễn Huệ, Quận 1, TP.HCM. Mình sẽ ghi nhận để giao hàng cho bạn nhé!\",\n");
+        prompt.append("  \"response_text\": \"Cảm ơn bạn, mình đã nhận được địa chỉ: 12 Đường Nguyễn Huệ, Quận 1, TP.HCM. Mình sẽ ghi nhận và gửi đơn hàng Cocacola của bạn đến địa chỉ này ngay nhé!\",\n");
         prompt.append("  \"detected_intent\": \"ADDRESS_RESPONSE\",\n");
         prompt.append("  \"extracted_address\": \"12 Đường Nguyễn Huệ, Quận 1, TP.HCM\",\n");
-        prompt.append("  \"action_required\": false\n");
+        prompt.append("  \"action_required\": true,\n");
+        prompt.append("  \"create_order\": true,\n");
+        prompt.append("  \"action_details\": {\n");
+        prompt.append("    \"action_type\": \"PLACEORDER\",\n");
+        prompt.append("    \"product_id\": 1,\n");
+        prompt.append("    \"quantity\": 1\n");
+        prompt.append("  }\n");
+        prompt.append("}\n\n");
+        
+        // Example for regular address response (no order needed)
+        prompt.append("Example - Simple Address Response (No Order):\n");
+        prompt.append("If you asked for address for account update (not for an order) and customer says: 'Tôi ở 45 Lê Lợi, Hà Nội'\n");
+        prompt.append("You MUST respond with:\n");
+        prompt.append("{\n");
+        prompt.append("  \"response_text\": \"Cảm ơn bạn, mình đã cập nhật địa chỉ: 45 Lê Lợi, Hà Nội vào hồ sơ của bạn!\",\n");
+        prompt.append("  \"detected_intent\": \"ADDRESS_RESPONSE\",\n");
+        prompt.append("  \"extracted_address\": \"45 Lê Lợi, Hà Nội\",\n");
+        prompt.append("  \"action_required\": false,\n");
+        prompt.append("  \"create_order\": false\n");
         prompt.append("}\n\n");
         
         // Image sending capability
@@ -883,7 +1125,8 @@ public class ShopAIServiceImpl implements ShopAIService {
         prompt.append("5. 'extracted_address': Any address mentioned by the customer (IMPORTANT FOR ORDERS)\n");
         prompt.append("6. 'extracted_phone': Any phone number mentioned by the customer\n");
         prompt.append("7. 'missing_information': Array of missing data needed\n");
-        prompt.append("8. 'follow_up_questions': Array of suggested questions\n\n");
+        prompt.append("8. 'follow_up_questions': Array of suggested questions\n");
+        prompt.append("9. 'create_order': Boolean indicating if an order should be created (for ADDRESS_RESPONSE intent)\n\n");
         
         // Customer message
         prompt.append("CURRENT CUSTOMER MESSAGE: \"").append(message).append("\"\n");
@@ -1551,7 +1794,11 @@ public class ShopAIServiceImpl implements ShopAIService {
             if (lastMessageWasAddressRequest) {
                 prompt.append("IMPORTANT: If this message is ONLY providing an address in response to a previous question, ");
                 prompt.append("set the detected_intent to 'ADDRESS_RESPONSE' instead of 'PLACEORDER'. ");
-                prompt.append("When the intent is ADDRESS_RESPONSE, set action_required to false.\n\n");
+                prompt.append("When the intent is ADDRESS_RESPONSE, set action_required to true and create_order to true.\n\n");
+                prompt.append("If you previously asked the customer for an address for an order, include these order details in the response:\n");
+                prompt.append("1. Set create_order: true\n");
+                prompt.append("2. Include full action_details with action_type: 'PLACEORDER', product_id and quantity\n");
+                prompt.append("3. Extract any product mention and quantities from previous messages\n\n");
             }
             
             prompt.append("IMPORTANT: Standard action codes to use:\n");
@@ -1580,6 +1827,20 @@ public class ShopAIServiceImpl implements ShopAIService {
             prompt.append("4. Set action_required: true for all cancellation requests\n");
             prompt.append("5. Always provide a clear confirmation in response_text\n\n");
             
+            // Add specific instructions for ADDRESS_RESPONSE intent detection
+            prompt.append("IMPORTANT ADDRESS_RESPONSE GUIDELINES:\n");
+            prompt.append("1. When customer is providing ONLY an address after you requested it:\n");
+            prompt.append("   - Set detected_intent: 'ADDRESS_RESPONSE'\n");
+            prompt.append("   - Set action_required: true\n");
+            prompt.append("   - Set create_order: true if this address is for an order\n");
+            prompt.append("   - Include extracted_address with the full address\n");
+            prompt.append("   - If this is for an order, include action_details with product_id and quantity\n");
+            prompt.append("2. Examples of address-only responses:\n");
+            prompt.append("   - 'Địa chỉ của tôi là 123 Đường ABC'\n");
+            prompt.append("   - 'Giao đến 72 Hương An, Huế nhé'\n");
+            prompt.append("   - 'Nhà mình ở số 45 đường Trần Hưng Đạo'\n\n");
+            
+            prompt.append("IMPORTANT: When customer asks about product images or product details, always prefer to use:\n");
             prompt.append("IMPORTANT: When customer asks about product images or product details, always prefer to use:\n");
             prompt.append("- SENDIMAGE: For sending multiple product images directly\n");
             prompt.append("- SHOWPRODUCT: For showing detailed product information with image\n\n");
