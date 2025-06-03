@@ -224,9 +224,8 @@ public class ShopTelegramBot extends TelegramLongPollingBot {
                             if (actionDetails.has("note")) {
                                 note = actionDetails.get("note").asText();
                             }
-                            
-                            // Tìm hoặc tạo thông tin khách hàng
-                            processPlaceOrder(userId, chatId, productId, quantity, note);
+                              // Tìm hoặc tạo thông tin khách hàng
+                            processPlaceOrder(update, userId, chatId, productId, quantity, note);
                         } catch (Exception e) {
                             log.error("Error processing order: {}", e.getMessage(), e);
                             sendTextMessage(chatId, "Xin lỗi, có lỗi xảy ra khi xử lý đơn hàng của bạn. Vui lòng thử lại sau.");
@@ -408,13 +407,14 @@ public class ShopTelegramBot extends TelegramLongPollingBot {
     }    /**
      * Xử lý đặt hàng
      * 
+     * @param update Telegram update để lấy thông tin user
      * @param userId ID người dùng Telegram
      * @param chatId ID chat Telegram
      * @param productId ID sản phẩm
      * @param quantity Số lượng
      * @param note Ghi chú
      */
-    private void processPlaceOrder(String userId, Long chatId, Long productId, Integer quantity, String note) {
+    private void processPlaceOrder(Update update, String userId, Long chatId, Long productId, Integer quantity, String note) {
         try {
             // Mặc định số lượng là 1 nếu không được chỉ định
             if (quantity == null) {
@@ -424,22 +424,35 @@ public class ShopTelegramBot extends TelegramLongPollingBot {
             // Lưu ý: Customer có thể đã được tạo bởi AI service trong processCustomerMessage
             String customerEmail = "telegram_" + userId + "@example.com";
             Customer customer = customerRepository.findByEmailAndShopId(customerEmail, shop.getId()).orElse(null);
-            
-            // Nếu không tìm thấy customer, có nghĩa là có lỗi logic vì AI service đã phải tạo customer trước đó
+              // Nếu không tìm thấy customer, có nghĩa là có lỗi logic vì AI service đã phải tạo customer trước đó
             if (customer == null) {
                 log.warn("Customer not found for email {} in shop {}. This should not happen as AI service should have created the customer.", customerEmail, shop.getId());
                 // Tạo customer mới như một fallback
                 customer = new Customer();
                 customer.setPhone(userId);
                 customer.setShop(shop);
-                customer.setFullname("Telegram User " + userId);
+                
+                // Get current username from the update for better customer name
+                String currentUsername = update.getMessage().getFrom().getUserName() != null ? 
+                        update.getMessage().getFrom().getUserName() : 
+                        update.getMessage().getFrom().getFirstName();
+                
+                String customerName = "Khách hàng Telegram #" + userId; // default fallback
+                if (currentUsername != null && !currentUsername.trim().isEmpty()) {
+                    customerName = currentUsername.trim();
+                    // If it's just a number (user ID), add prefix for clarity
+                    if (currentUsername.matches("\\d+")) {
+                        customerName = "Khách hàng Telegram #" + currentUsername;
+                    }
+                }
+                
+                customer.setFullname(customerName);
                 customer.setAddress("Đang cập nhật");
                 customer.setEmail(customerEmail);
                 customer = customerRepository.save(customer);
-                log.info("Created fallback customer with ID: {} for userId: {}", customer.getId(), userId);
+                log.info("Created fallback customer with ID: {} for userId: {}, name: {}", customer.getId(), userId, customerName);
             }
-            
-            // Nếu không có productId, thông báo lỗi
+              // Nếu không có productId, thông báo lỗi
             if (productId == null) {
                 sendTextMessage(chatId, "Xin lỗi, không tìm thấy thông tin sản phẩm trong đơn hàng.");
                 return;
@@ -449,6 +462,38 @@ public class ShopTelegramBot extends TelegramLongPollingBot {
             Product product = shopAIService.getProductById(shop.getId(), productId);
             if (product == null) {
                 sendTextMessage(chatId, "Xin lỗi, không tìm thấy sản phẩm với ID: " + productId);
+                return;
+            }
+            
+            // Check if an order was already created recently by AI service to prevent duplicates
+            // Look for orders created in the last 30 seconds for this customer and product
+            java.time.LocalDateTime recentTime = java.time.LocalDateTime.now().minusSeconds(30);
+            List<OrderDTO> recentOrders = orderService.findRecentOrdersByCustomerAndProduct(
+                customer.getId(), productId, recentTime);
+            
+            if (!recentOrders.isEmpty()) {
+                log.info("Found recent order for customer {} and product {}, preventing duplicate creation", 
+                    customer.getId(), productId);
+                
+                // Send confirmation for the existing order instead of creating a new one
+                OrderDTO existingOrder = recentOrders.get(0);
+                String confirmationMessage = String.format(
+                    "✅ Đơn hàng của bạn đã được xử lý thành công!\n\n" +
+                    "🔢 Mã đơn hàng: #%d\n" +
+                    "🛍️ Sản phẩm: %s\n" +
+                    "🔢 Số lượng: %d\n" +
+                    "🏷️ Trạng thái: %s\n\n" +
+                    "📦 Địa chỉ giao hàng: %s\n\n" +
+                    "Cảm ơn bạn đã mua hàng tại %s!",
+                    existingOrder.getId(),
+                    existingOrder.getProductName(),
+                    existingOrder.getQuantity(),
+                    existingOrder.getStatus().toString(),
+                    customer.getAddress(),
+                    shop.getName()
+                );
+                
+                sendTextMessage(chatId, confirmationMessage);
                 return;
             }
               // AI service đã đảm bảo customer có địa chỉ hợp lệ trước khi gọi processPlaceOrder

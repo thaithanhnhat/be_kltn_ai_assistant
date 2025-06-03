@@ -137,8 +137,7 @@ public class CustomerServiceImpl implements CustomerService {
         
         return customerRepository.save(customer);
     }
-    
-    @Override
+      @Override
     @Transactional
     public Customer createNewCustomer(Long shopId, String phone, String name, String email) {
         Shop shop = shopRepository.findById(shopId)
@@ -147,7 +146,22 @@ public class CustomerServiceImpl implements CustomerService {
         Customer customer = new Customer();
         customer.setShop(shop);
         customer.setPhone(phone != null ? phone : "unknown");
-        customer.setFullname(name != null ? name : "New Customer");
+        
+        // Improve customer name logic
+        String customerName = "New Customer"; // default fallback
+        if (name != null && !name.trim().isEmpty()) {
+            customerName = name.trim();
+        } else if (email != null && email.startsWith("telegram_")) {
+            // Extract user ID from telegram email pattern for better fallback
+            String userId = email.replace("telegram_", "").replace("@example.com", "");
+            customerName = "Khách hàng Telegram #" + userId;
+        } else if (email != null && email.startsWith("facebook_")) {
+            // Extract user ID from facebook email pattern for better fallback
+            String userId = email.replace("facebook_", "").replace("@example.com", "");
+            customerName = "Khách hàng Facebook #" + userId;
+        }
+        
+        customer.setFullname(customerName);
         customer.setEmail(email != null ? email : "unknown@example.com");
         customer.setAddress("Đang cập nhật"); // Temporary placeholder
         

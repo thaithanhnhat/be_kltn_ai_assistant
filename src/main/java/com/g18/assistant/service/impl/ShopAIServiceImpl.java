@@ -2304,9 +2304,7 @@ public class ShopAIServiceImpl implements ShopAIService {
             log.error("Error checking missing customer address: {}", e.getMessage(), e);
             return null; // Continue with normal processing if this fails
         }
-    }
-
-    /**
+    }    /**
      * Save an order based on AI conversation
      * @param customerId Customer ID
      * @param productId Product ID
@@ -2314,6 +2312,9 @@ public class ShopAIServiceImpl implements ShopAIService {
      * @return The created OrderDTO
      */
     private OrderDTO saveOrderFromAI(Long customerId, Long productId, int quantity) {
+        log.info("Creating order from AI - Customer: {}, Product: {}, Quantity: {}", 
+                customerId, productId, quantity);
+        
         CreateOrderRequest orderRequest = CreateOrderRequest.builder()
                 .customerId(customerId)
                 .productId(productId)
@@ -2324,6 +2325,8 @@ public class ShopAIServiceImpl implements ShopAIService {
                 
         // Call the order service to create the order
         OrderDTO createdOrder = orderService.createOrder(orderRequest);
+        
+        log.info("Successfully created order with ID: {} from AI", createdOrder.getId());
         return createdOrder;
     }
 
@@ -2551,8 +2554,7 @@ public class ShopAIServiceImpl implements ShopAIService {
                 Customer customer = customerService.getCustomerById(order.getCustomerId());
                 if (customer != null && customer.getAddress() != null && !customer.getAddress().isEmpty()) {
                     response.append("📍 Địa chỉ: ").append(customer.getAddress()).append("\n");
-                }
-                if (customer != null && customer.getPhone() != null && !customer.getPhone().isEmpty()) {
+                }                if (customer != null && customer.getPhone() != null && !customer.getPhone().isEmpty()) {
                     response.append("📞 Số điện thoại: ").append(customer.getPhone()).append("\n");
                 }
             } catch (Exception e) {
