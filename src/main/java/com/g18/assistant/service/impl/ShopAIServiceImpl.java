@@ -30,6 +30,7 @@ import org.springframework.http.*;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -630,8 +631,7 @@ public class ShopAIServiceImpl implements ShopAIService {
                             log.info("Order cancelled from intent analysis: Order ID: {}", orderId);
                         } catch (NumberFormatException e) {
                             log.warn("Invalid order ID format: {}", actionDetails.get("order_id").asText());
-                        }
-                    } else {
+                        }                    } else {
                         // No specific order_id, try to find the most recent order for this customer
                         Long orderId = findRecentOrderId(customer.getId());
                         if (orderId != null) {
@@ -640,6 +640,76 @@ public class ShopAIServiceImpl implements ShopAIService {
                             log.info("Most recent order cancelled from intent analysis: Order ID: {}", orderId);
                         } else {
                             log.info("No recent order found to cancel for customer ID: {}", customer.getId());
+                        }
+                    }
+                }
+            }
+            
+            // Check for order checking intent in the intent analysis
+            if ("CHECKORDER".equals(detectedIntent) && 
+                analysisJson.has("action_required") && analysisJson.get("action_required").asBoolean() &&
+                analysisJson.has("action_details") && customer != null) {
+                
+                JsonNode actionDetails = analysisJson.get("action_details");
+                if (actionDetails.has("action_type") && 
+                    "CHECKORDER".equals(actionDetails.get("action_type").asText())) {
+                    
+                    // Check if order_id is provided
+                    if (actionDetails.has("order_id")) {
+                        try {
+                            // Try to parse order_id as a Long
+                            Long orderId = Long.parseLong(actionDetails.get("order_id").asText());
+                            // Get order information
+                            OrderDTO orderInfo = getOrderInfoFromAI(orderId, customer.getId());
+                            if (orderInfo != null) {
+                                // Return order information directly from intent analysis
+                                String orderStatusResponse = formatOrderStatusResponse(orderInfo);
+                                log.info("Order information retrieved from intent analysis: Order ID: {}, Status: {}", 
+                                        orderId, orderInfo.getStatus());
+                                
+                                // Return formatted response
+                                ObjectNode checkOrderResponse = objectMapper.createObjectNode();
+                                checkOrderResponse.put("response_text", orderStatusResponse);
+                                checkOrderResponse.put("detected_intent", "CHECKORDER");
+                                checkOrderResponse.put("needs_shop_context", false);
+                                checkOrderResponse.put("action_required", false);
+                                
+                                // Add to conversation history
+                                conversationHistoryService.addMessage(shopId, customerId, "customer", message);
+                                conversationHistoryService.addMessage(shopId, customerId, "assistant", orderStatusResponse);
+                                
+                                return objectMapper.writeValueAsString(checkOrderResponse);
+                            } else {
+                                log.info("Order not found or customer not authorized: Order ID: {}", orderId);
+                            }
+                        } catch (NumberFormatException e) {
+                            log.warn("Invalid order ID format for checking: {}", actionDetails.get("order_id").asText());
+                        }
+                    } else {
+                        // No specific order_id, get the most recent order for this customer
+                        Long recentOrderId = findRecentOrderId(customer.getId());
+                        if (recentOrderId != null) {
+                            OrderDTO orderInfo = getOrderInfoFromAI(recentOrderId, customer.getId());
+                            if (orderInfo != null) {
+                                String orderStatusResponse = formatOrderStatusResponse(orderInfo);
+                                log.info("Most recent order information retrieved from intent analysis: Order ID: {}, Status: {}", 
+                                        recentOrderId, orderInfo.getStatus());
+                                
+                                // Return formatted response
+                                ObjectNode checkOrderResponse = objectMapper.createObjectNode();
+                                checkOrderResponse.put("response_text", orderStatusResponse);
+                                checkOrderResponse.put("detected_intent", "CHECKORDER");
+                                checkOrderResponse.put("needs_shop_context", false);
+                                checkOrderResponse.put("action_required", false);
+                                
+                                // Add to conversation history
+                                conversationHistoryService.addMessage(shopId, customerId, "customer", message);
+                                conversationHistoryService.addMessage(shopId, customerId, "assistant", orderStatusResponse);
+                                
+                                return objectMapper.writeValueAsString(checkOrderResponse);
+                            }
+                        } else {
+                            log.info("No recent order found to check for customer ID: {}", customer.getId());
                         }
                     }
                 }
@@ -676,9 +746,71 @@ public class ShopAIServiceImpl implements ShopAIService {
                         if (orderId != null) {
                             cancelOrderFromAI(orderId);
                             orderCancelled = true;
-                            log.info("Most recent order cancelled from full AI response: Order ID: {}", orderId);
-                        } else {
+                            log.info("Most recent order cancelled from full AI response: Order ID: {}", orderId);                        } else {
                             log.info("No recent order found to cancel for customer ID: {}", customer.getId());
+                        }
+                    }
+                }
+            }
+            
+            // Handle order checking if that's the intent
+            if ("CHECKORDER".equals(fullResponseIntent) && 
+                aiResponseJson.has("action_required") && 
+                aiResponseJson.get("action_required").asBoolean() &&
+                aiResponseJson.has("action_details") && customer != null) {
+                
+                JsonNode actionDetails = aiResponseJson.get("action_details");
+                if (actionDetails.has("action_type") && 
+                    "CHECKORDER".equals(actionDetails.get("action_type").asText())) {
+                    
+                    // Check if order_id is provided
+                    if (actionDetails.has("order_id")) {
+                        try {
+                            // Try to parse order_id as a Long
+                            Long orderId = Long.parseLong(actionDetails.get("order_id").asText());
+                            // Get order information
+                            OrderDTO orderInfo = getOrderInfoFromAI(orderId, customer.getId());
+                            if (orderInfo != null) {
+                                // Update AI response with order information
+                                String orderStatusResponse = formatOrderStatusResponse(orderInfo);
+                                log.info("Order information retrieved from full AI response: Order ID: {}, Status: {}", 
+                                        orderId, orderInfo.getStatus());
+                                
+                                // Update response text with order details
+                                try {
+                                    ObjectNode updatedResponse = (ObjectNode) aiResponseJson;
+                                    updatedResponse.put("response_text", orderStatusResponse);
+                                    aiResponse = objectMapper.writeValueAsString(updatedResponse);
+                                } catch (Exception e) {
+                                    log.error("Error updating response with order info: {}", e.getMessage());
+                                }
+                            } else {
+                                log.info("Order not found or customer not authorized: Order ID: {}", orderId);
+                            }
+                        } catch (NumberFormatException e) {
+                            log.warn("Invalid order ID format for checking: {}", actionDetails.get("order_id").asText());
+                        }
+                    } else {
+                        // No specific order_id, get the most recent order for this customer
+                        Long recentOrderId = findRecentOrderId(customer.getId());
+                        if (recentOrderId != null) {
+                            OrderDTO orderInfo = getOrderInfoFromAI(recentOrderId, customer.getId());
+                            if (orderInfo != null) {
+                                String orderStatusResponse = formatOrderStatusResponse(orderInfo);
+                                log.info("Most recent order information retrieved: Order ID: {}, Status: {}", 
+                                        recentOrderId, orderInfo.getStatus());
+                                
+                                // Update response text with order details
+                                try {
+                                    ObjectNode updatedResponse = (ObjectNode) aiResponseJson;
+                                    updatedResponse.put("response_text", orderStatusResponse);
+                                    aiResponse = objectMapper.writeValueAsString(updatedResponse);
+                                } catch (Exception e) {
+                                    log.error("Error updating response with order info: {}", e.getMessage());
+                                }
+                            }
+                        } else {
+                            log.info("No recent order found to check for customer ID: {}", customer.getId());
                         }
                     }
                 }
@@ -1820,8 +1952,7 @@ public class ShopAIServiceImpl implements ShopAIService {
             prompt.append("- CONVERSATION_REFERENCE: Customer is asking about previous conversation\n");
             prompt.append("- ADDRESS_RESPONSE: Customer is providing their address in response to a request\n");
             prompt.append("- GENERAL_QUERY: General question not fitting other categories\n\n");
-            
-            // Add specific instructions for ORDER CANCELLATION intent detection
+              // Add specific instructions for ORDER CANCELLATION intent detection
             prompt.append("IMPORTANT CANCELORDER DETECTION GUIDELINES:\n");
             prompt.append("1. Use CANCELORDER intent when messages include phrases like:\n");
             prompt.append("   - 'hủy đơn hàng', 'hủy đơn', 'không mua nữa'\n");
@@ -1832,6 +1963,22 @@ public class ShopAIServiceImpl implements ShopAIService {
             prompt.append("3. If no order ID is mentioned, do NOT include the 'order_id' field\n");
             prompt.append("4. Set action_required: true for all cancellation requests\n");
             prompt.append("5. Always provide a clear confirmation in response_text\n\n");
+            
+            // Add specific instructions for ORDER CHECKING intent detection
+            prompt.append("IMPORTANT CHECKORDER DETECTION GUIDELINES:\n");
+            prompt.append("1. Use CHECKORDER intent when messages include phrases like:\n");
+            prompt.append("   - 'check tình trạng đơn hàng', 'kiểm tra đơn hàng', 'xem đơn hàng'\n");
+            prompt.append("   - 'đơn hàng của tôi thế nào', 'order status', 'check my order'\n");
+            prompt.append("   - 'tình trạng giao hàng', 'đơn hàng đến đâu rồi'\n");
+            prompt.append("2. CRITICAL: Always extract order ID when mentioned:\n");
+            prompt.append("   - '#61', 'đơn hàng #61' -> order_id: '61'\n");
+            prompt.append("   - 'đơn hàng số 25', 'mã đơn 25' -> order_id: '25'\n");
+            prompt.append("   - 'order 123', '#123' -> order_id: '123'\n");
+            prompt.append("3. Include action_details with:\n");
+            prompt.append("   - action_type: 'CHECKORDER'\n");
+            prompt.append("   - order_id: The extracted order number (if mentioned)\n");
+            prompt.append("4. Set action_required: true for all order checking requests\n");
+            prompt.append("5. If no order ID is mentioned, omit the order_id field\n\n");
               // Add specific instructions for ADDRESS_RESPONSE intent detection
             prompt.append("IMPORTANT ADDRESS_RESPONSE GUIDELINES:\n");
             prompt.append("1. When customer is providing ONLY an address after you requested it:\n");
@@ -2304,11 +2451,182 @@ public class ShopAIServiceImpl implements ShopAIService {
                     }
                 }
             }
-            
-            return null; // No valid orders found
+              return null; // No valid orders found
         } catch (Exception e) {
             log.error("Error finding recent order for customer: {}", e.getMessage(), e);
             return null;
         }
     }
-} 
+    
+    /**
+     * Get order information for order checking
+     * @param orderId Order ID to check
+     * @param customerId Customer ID for authorization
+     * @return OrderDTO if found and authorized, null otherwise
+     */
+    private OrderDTO getOrderInfoFromAI(Long orderId, Long customerId) {
+        try {
+            // Get the order by ID
+            OrderDTO order = orderService.getOrderById(orderId);
+            
+            if (order != null) {
+                // Verify that this order belongs to the customer
+                if (order.getCustomerId().equals(customerId)) {
+                    return order;
+                } else {
+                    log.warn("Customer {} attempted to access order {} that doesn't belong to them", 
+                            customerId, orderId);
+                    return null;
+                }
+            }
+            
+            return null; // Order not found
+        } catch (Exception e) {
+            log.error("Error getting order info for checking: {}", e.getMessage(), e);
+            return null;
+        }
+    }
+      /**
+     * Format order status response for customer
+     * @param order Order DTO to format
+     * @return Formatted response string in Vietnamese
+     */
+    private String formatOrderStatusResponse(OrderDTO order) {
+        try {
+            StringBuilder response = new StringBuilder();
+            
+            // Header with order ID
+            response.append("═══════════════════════════════════\n");
+            response.append("📦 THÔNG TIN ĐỚN HÀNG #").append(order.getId()).append("\n");
+            response.append("═══════════════════════════════════\n\n");
+            
+            // Order status with colored emoji
+            String statusInVietnamese = getOrderStatusInVietnamese(order.getStatus());
+            String statusEmoji = getStatusEmoji(order.getStatus());
+            response.append(statusEmoji).append("TRẠNG THÁI: ").append(statusInVietnamese).append("\n\n");
+            
+            // Order details section
+            response.append("📋 CHI TIẾT ĐƠN HÀNG:\n");
+            response.append("─────────────────────────────────\n");
+            
+            // Order date
+            if (order.getCreatedAt() != null) {
+                response.append("📅 Ngày đặt: ").append(order.getCreatedAt().format(
+                    java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy 'lúc' HH:mm"))).append("\n");
+            }
+            
+            // Product information
+            if (order.getProductName() != null) {
+                response.append("🛍️ Sản phẩm: ").append(order.getProductName()).append("\n");
+            }
+            
+            if (order.getQuantity() != null) {
+                response.append("🔢 Số lượng: ").append(order.getQuantity()).append(" sản phẩm\n");
+            }
+            
+            // Total amount - calculate from product price and quantity
+            try {
+                // Get shop ID from customer since OrderDTO doesn't have shopId field
+                Customer customer = customerService.getCustomerById(order.getCustomerId());
+                if (customer != null && customer.getShop() != null) {
+                    Long shopId = customer.getShop().getId();
+                    Product product = getProductById(shopId, order.getProductId());
+                    if (product != null && product.getPrice() != null && order.getQuantity() != null) {
+                        BigDecimal unitPrice = product.getPrice();
+                        BigDecimal totalAmount = unitPrice.multiply(BigDecimal.valueOf(order.getQuantity()));
+                        response.append("💵 Đơn giá: ").append(String.format("%,.0f", unitPrice)).append(" VNĐ\n");
+                        response.append("💰 Tổng tiền: ").append(String.format("%,.0f", totalAmount)).append(" VNĐ\n");
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("Could not calculate total amount for order {}: {}", order.getId(), e.getMessage());
+            }
+            
+            // Delivery information section
+            response.append("\n🚚 THÔNG TIN GIAO HÀNG:\n");
+            response.append("─────────────────────────────────\n");
+            
+            // Delivery address - get from customer
+            try {
+                Customer customer = customerService.getCustomerById(order.getCustomerId());
+                if (customer != null && customer.getAddress() != null && !customer.getAddress().isEmpty()) {
+                    response.append("📍 Địa chỉ: ").append(customer.getAddress()).append("\n");
+                }
+                if (customer != null && customer.getPhone() != null && !customer.getPhone().isEmpty()) {
+                    response.append("📞 Số điện thoại: ").append(customer.getPhone()).append("\n");
+                }
+            } catch (Exception e) {
+                log.warn("Could not get delivery info for order {}: {}", order.getId(), e.getMessage());
+            }
+            
+            // Status-specific message
+            response.append("\n").append("═".repeat(35)).append("\n");
+            switch (order.getStatus()) {
+                case PENDING:
+                    response.append("⏳ GHI CHÚ: Đơn hàng đang được xử lý.\n");
+                    response.append("   Cửa hàng sẽ liên hệ với bạn trong thời gian sớm nhất!");
+                    break;
+                case CONFIRMED:
+                    response.append("✅ GHI CHÚ:Đơn hàng đã được xác nhận!\n");
+                    response.append("   Sản phẩm đang được chuẩn bị và sẽ giao đến bạn sớm.");
+                    break;
+                case DELIVERED:
+                    response.append("🎉 CHÚC MỪNG: Đơn hàng đã được giao thành công!\n");
+                    response.append("   Cảm ơn bạn đã tin tưởng và mua sắm tại cửa hàng.");
+                    break;
+                case CANCELLED:
+                    response.append("❌ THÔNG BÁO: Đơn hàng đã bị hủy.\n");
+                    response.append("   Nếu có thắc mắc, vui lòng liên hệ cửa hàng.");
+                    break;
+                default:
+                    response.append("📞 LIÊN HỆ: Vui lòng liên hệ cửa hàng để biết thêm chi tiết!");
+                    break;
+            }
+            response.append("\n").append("═".repeat(35));
+            
+            return response.toString();
+        } catch (Exception e) {
+            log.error("Error formatting order status response: {}", e.getMessage(), e);
+            return "❌ Xin lỗi, có lỗi khi lấy thông tin đơn hàng. Vui lòng thử lại sau hoặc liên hệ cửa hàng để được hỗ trợ.";
+        }
+    }
+      /**
+     * Convert order status to Vietnamese
+     * @param status Order status enum
+     * @return Vietnamese status string
+     */
+    private String getOrderStatusInVietnamese(OrderStatus status) {
+        switch (status) {
+            case PENDING:
+                return "Đang chờ xử lý";
+            case CONFIRMED:
+                return "Đã xác nhận";
+            case DELIVERED:
+                return "Đã giao hàng";
+            case CANCELLED:
+                return "Đã hủy";
+            default:
+                return "Không xác định";
+        }
+    }
+    
+    /**
+     * Get emoji for order status
+     * @param status Order status enum
+     * @return Appropriate emoji for the status
+     */
+    private String getStatusEmoji(OrderStatus status) {
+        switch (status) {
+            case PENDING:
+                return "⏳";
+            case CONFIRMED:
+                return "✅";
+            case DELIVERED:
+                return "🎉";
+            case CANCELLED:
+                return "❌";
+            default:
+                return "❓";
+        }
+    }
+}

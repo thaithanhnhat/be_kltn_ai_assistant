@@ -200,6 +200,7 @@ com\g18\assistant\entity\Shop.class
 com\g18\assistant\dto\request\UserProfileUpdateRequest$UserProfileUpdateRequestBuilder.class
 com\g18\assistant\service\PendingOrderService$PendingOrderInfo.class
 com\g18\assistant\dto\response\VNPayResponse.class
+com\g18\assistant\service\impl\ShopAIServiceImpl$1.class
 com\g18\assistant\dto\request\TokenRefreshRequest.class
 com\g18\assistant\service\ProductService.class
 com\g18\assistant\dto\response\ShopResponse.class
