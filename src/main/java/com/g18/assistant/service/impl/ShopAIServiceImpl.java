@@ -17,6 +17,7 @@ import com.g18.assistant.repository.ProductRepository;
 import com.g18.assistant.service.ConversationHistoryService;
 import com.g18.assistant.service.CustomerService;
 import com.g18.assistant.service.OrderService;
+import com.g18.assistant.service.PendingOrderService;
 import com.g18.assistant.service.ProductService;
 import com.g18.assistant.service.ShopAIService;
 import com.g18.assistant.service.ShopService;
@@ -32,7 +33,6 @@ import org.springframework.web.client.RestTemplate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.HashMap;
 
 @Service
@@ -43,24 +43,20 @@ public class ShopAIServiceImpl implements ShopAIService {
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
     private final ProductService productService;
-    private final ShopService shopService;
-    private final CustomerRepository customerRepository;
+    private final ShopService shopService;    private final CustomerRepository customerRepository;
     private final ProductRepository productRepository;
     private final ConversationHistoryService conversationHistoryService;
     private final CustomerService customerService;
     private final OrderService orderService;
+    private final PendingOrderService pendingOrderService;
 
     @Value("${app.gemini.api-key}")
     private String geminiApiKey;
     
     @Value("${app.gemini.chat-model-id}")
     private String geminiChatModel;
-    
-    @Value("${app.gemini.api-url}")
+      @Value("${app.gemini.api-url}")
     private String geminiApiUrl;
-    
-    // Add a map to track pending orders that need address information
-    private final Map<String, Map<String, Object>> pendingOrders = new ConcurrentHashMap<>();
     
     @Override
     public String processCustomerMessage(Long shopId, String customerId, String customerName, String message) {
@@ -74,26 +70,25 @@ public class ShopAIServiceImpl implements ShopAIService {
             
             // Extract potentially useful customer information from the message
             Map<String, String> extractedInfo = customerService.extractCustomerInfoFromMessage(message);
-            
-            // Find or create a customer record
+              // Find or create a customer record
             Customer customer = null;
             
-            // Try to find by the given customer ID (phone number)
+            // For Telegram users, use email pattern: telegram_{username}@example.com
+            String customerEmail = null;
             if (customerId != null && !customerId.isEmpty()) {
-                customer = customerService.findByPhoneAndShopId(customerId, shopId);
+                // Generate email pattern for Telegram user
+                customerEmail = "telegram_" + customerId + "@example.com";
                 
-                // If not found, try by email
-                if (customer == null && extractedInfo.containsKey("email")) {
-                    customer = customerService.findByEmailAndShopId(extractedInfo.get("email"), shopId);
-                }
+                // Try to find by email pattern first
+                customer = customerService.findByEmailAndShopId(customerEmail, shopId);
                 
-                // If still not found, create a new customer
+                // If still not found, create a new customer with email pattern
                 if (customer == null) {
                     customer = customerService.createNewCustomer(
                         shopId, 
                         customerId, 
                         customerName,
-                        extractedInfo.getOrDefault("email", null)
+                        customerEmail
                     );
                 }
                 
@@ -144,10 +139,9 @@ public class ShopAIServiceImpl implements ShopAIService {
 
             // Format history string
             String historyStr = formatConversationHistory(history);
-            
-            // Check if there's a pending order for this customer
+              // Check if there's a pending order for this customer
             String customerKey = shopId + ":" + customerId;
-            Map<String, Object> pendingOrder = pendingOrders.get(customerKey);
+            PendingOrderService.PendingOrderInfo pendingOrder = pendingOrderService.getPendingOrder(customerKey);
             
             // Check if this message is likely just providing an address (quick check before AI call)
             boolean isLikelyAddressOnly = isProbablyAddressOnly(message, history);
@@ -221,12 +215,11 @@ public class ShopAIServiceImpl implements ShopAIService {
                     if (hasValidAddress && !orderCreated) {
                         // Create the order directly from the address response
                         saveOrderFromAI(customer.getId(), productId, quantity);
-                        orderCreated = true;
-                        log.info("Created order directly from address response with PLACEORDER action: Product ID: {}, Quantity: {}", 
+                        orderCreated = true;                        log.info("Created order directly from address response with PLACEORDER action: Product ID: {}, Quantity: {}", 
                                 productId, quantity);
                                 
                         // Remove any pending orders
-                        pendingOrders.remove(customerKey);
+                        pendingOrderService.removePendingOrder(customerKey);
                         
                         // We can return the response immediately since we've processed the order
                         return intentAnalysis;
@@ -250,36 +243,36 @@ public class ShopAIServiceImpl implements ShopAIService {
                     if (hasValidAddress && !orderCreated) {
                         // Create the order directly from the address response
                         saveOrderFromAI(customer.getId(), productId, quantity);
-                        orderCreated = true;
-                        log.info("Created order directly from address response with create_order field: Product ID: {}, Quantity: {}", 
+                        orderCreated = true;                        log.info("Created order directly from address response with create_order field: Product ID: {}, Quantity: {}", 
                                 productId, quantity);
                                 
                         // Remove any pending orders
-                        pendingOrders.remove(customerKey);
-                        
-                        // We can return the response immediately since we've processed the order
-                        return intentAnalysis;
+                        pendingOrderService.removePendingOrder(customerKey);
+                          // We can return the response immediately since we've processed the order                        return intentAnalysis;
                     }
-                } else if (pendingOrder != null) {
-                    // If no explicit create_order field but we have a pending order, use that
-                    Long productId = ((Number) pendingOrder.get("productId")).longValue();
-                    int quantity = ((Number) pendingOrder.get("quantity")).intValue();
-                    
-                    // Check if we have a valid address now
-                    boolean hasValidAddress = extractedAddress != null || 
-                                             (customer.getAddress() != null && 
-                                              !customer.getAddress().isEmpty() && 
-                                              !customer.getAddress().equals("Đang cập nhật"));
-                    
-                    if (hasValidAddress && !orderCreated) {
-                        // Create the order using the pending information
-                        saveOrderFromAI(customer.getId(), productId, quantity);
-                        orderCreated = true;
-                        log.info("Created order from pending request after address response: Product ID: {}, Quantity: {}", 
-                                productId, quantity);
+                }
+                  // If this is just an address response but no explicit order creation, check for pending orders
+                if (!orderCreated) {
+                    if (pendingOrder != null) {
+                        // If no explicit create_order field but we have a pending order, use that
+                        Long productId = pendingOrder.getProductId();
+                        int quantity = pendingOrder.getQuantity();
                         
-                        // Remove the pending order
-                        pendingOrders.remove(customerKey);
+                        // Check if we have a valid address now
+                        boolean hasValidAddress = extractedAddress != null || 
+                                                 (customer.getAddress() != null && 
+                                                  !customer.getAddress().isEmpty() && 
+                                                  !customer.getAddress().equals("Đang cập nhật"));
+                        
+                        if (hasValidAddress) {
+                            // Create the order using the pending information
+                            saveOrderFromAI(customer.getId(), productId, quantity);
+                            orderCreated = true;                            log.info("Created order from pending request after address response: Product ID: {}, Quantity: {}", 
+                                    productId, quantity);
+                            
+                            // Remove the pending order
+                            pendingOrderService.removePendingOrder(customerKey);
+                        }
                     }
                 }
                 
@@ -316,14 +309,10 @@ public class ShopAIServiceImpl implements ShopAIService {
                     customer.getAddress() == null || 
                     customer.getAddress().isEmpty() || 
                     customer.getAddress().equals("Đang cập nhật");
-                
-                if (needsAddress && !orderCreated) {
+                  if (needsAddress && !orderCreated) {
                     // Store pending order details
-                    Map<String, Object> orderDetails = new HashMap<>();
-                    orderDetails.put("productId", productId);
-                    orderDetails.put("quantity", quantity);
-                    orderDetails.put("timestamp", System.currentTimeMillis());
-                    pendingOrders.put(customerKey, orderDetails);
+                    pendingOrderService.storePendingOrder(customerKey, customer.getId(), productId, quantity, 
+                            PendingOrderService.OrderSource.AI_CHAT);
                     log.info("Stored pending order for customer {}: Product ID: {}, Quantity: {}", 
                            customerKey, productId, quantity);
                 }
@@ -367,21 +356,17 @@ public class ShopAIServiceImpl implements ShopAIService {
                             
                             // Save the order
                             saveOrderFromAI(customer.getId(), productId, quantity);
-                            orderCreated = true;
-                            log.info("Order created from intent analysis: Product ID: {}, Quantity: {}", 
+                            orderCreated = true;                            log.info("Order created from intent analysis: Product ID: {}, Quantity: {}", 
                                     productId, quantity);
                             
                             // Clear any pending orders
-                            pendingOrders.remove(customerKey);
+                            pendingOrderService.removePendingOrder(customerKey);
                         } else {
                             log.info("Not creating order yet because no address is available");
                             
                             // Store this as a pending order
-                            Map<String, Object> orderDetails = new HashMap<>();
-                            orderDetails.put("productId", productId);
-                            orderDetails.put("quantity", quantity);
-                            orderDetails.put("timestamp", System.currentTimeMillis());
-                            pendingOrders.put(customerKey, orderDetails);
+                            pendingOrderService.storePendingOrder(customerKey, customer.getId(), productId, quantity, 
+                                    PendingOrderService.OrderSource.AI_CHAT);
                             log.info("Stored pending order for customer {}: Product ID: {}, Quantity: {}", 
                                    customerKey, productId, quantity);
                         }
@@ -469,12 +454,11 @@ public class ShopAIServiceImpl implements ShopAIService {
                         if (hasValidAddress) {
                             // Create the order directly from the address response
                             saveOrderFromAI(customer.getId(), productId, quantity);
-                            orderCreated = true;
-                            log.info("Created order from full AI address response with PLACEORDER action: Product ID: {}, Quantity: {}", 
+                            orderCreated = true;                            log.info("Created order from full AI address response with PLACEORDER action: Product ID: {}, Quantity: {}", 
                                     productId, quantity);
                                     
                             // Remove any pending orders
-                            pendingOrders.remove(customerKey);
+                            pendingOrderService.removePendingOrder(customerKey);
                         }
                     }
                     // Fallback to the create_order flag (may be used in future responses)
@@ -495,17 +479,15 @@ public class ShopAIServiceImpl implements ShopAIService {
                         if (hasValidAddress) {
                             // Create the order directly from the address response
                             saveOrderFromAI(customer.getId(), productId, quantity);
-                            orderCreated = true;
-                            log.info("Created order from full AI address response with create_order: Product ID: {}, Quantity: {}", 
+                            orderCreated = true;                            log.info("Created order from full AI address response with create_order: Product ID: {}, Quantity: {}", 
                                     productId, quantity);
                                     
                             // Remove any pending orders
-                            pendingOrders.remove(customerKey);
-                        }
-                    } else if (pendingOrder != null) {
+                            pendingOrderService.removePendingOrder(customerKey);
+                        }                    } else if (pendingOrder != null) {
                         // If no explicit create_order field but we have a pending order, use that
-                        Long productId = ((Number) pendingOrder.get("productId")).longValue();
-                        int quantity = ((Number) pendingOrder.get("quantity")).intValue();
+                        Long productId = pendingOrder.getProductId();
+                        int quantity = pendingOrder.getQuantity();
                         
                         // Check if we have a valid address now
                         boolean hasValidAddress = extractedAddress != null || 
@@ -516,12 +498,11 @@ public class ShopAIServiceImpl implements ShopAIService {
                         if (hasValidAddress) {
                             // Create the order using the pending information
                             saveOrderFromAI(customer.getId(), productId, quantity);
-                            orderCreated = true;
-                            log.info("Created order from pending request after full AI address response: Product ID: {}, Quantity: {}", 
+                            orderCreated = true;                            log.info("Created order from pending request after full AI address response: Product ID: {}, Quantity: {}", 
                                     productId, quantity);
                             
                             // Remove the pending order
-                            pendingOrders.remove(customerKey);
+                            pendingOrderService.removePendingOrder(customerKey);
                         }
                     }
                 }
@@ -598,21 +579,17 @@ public class ShopAIServiceImpl implements ShopAIService {
                                 // Save the order only once
                                 saveOrderFromAI(customer.getId(), productId, quantity);
                                 orderCreated = true;
-                                
-                                log.info("Order saved successfully from AI response: Product ID: {}, Quantity: {}, Customer ID: {}", 
+                                  log.info("Order saved successfully from AI response: Product ID: {}, Quantity: {}, Customer ID: {}", 
                                         productId, quantity, customer.getId());
                                 
                                 // Clear any pending orders
-                                pendingOrders.remove(customerKey);
+                                pendingOrderService.removePendingOrder(customerKey);
                             } else {
                                 log.info("Not creating order because no valid address is available");
                                 
                                 // Store as pending order
-                                Map<String, Object> orderDetails = new HashMap<>();
-                                orderDetails.put("productId", productId);
-                                orderDetails.put("quantity", quantity);
-                                orderDetails.put("timestamp", System.currentTimeMillis());
-                                pendingOrders.put(customerKey, orderDetails);
+                                pendingOrderService.storePendingOrder(customerKey, customer.getId(), productId, quantity, 
+                                        PendingOrderService.OrderSource.AI_CHAT);
                                 log.info("Stored pending order from full AI for customer {}: Product ID: {}, Quantity: {}", 
                                        customerKey, productId, quantity);
                             }
@@ -748,20 +725,18 @@ public class ShopAIServiceImpl implements ShopAIService {
     }
 
     @Override
-    public String processOrderRequest(Long shopId, String customerId, String orderRequest) {
-        try {
+    public String processOrderRequest(Long shopId, String customerId, String orderRequest) {        try {
             // Get shop information without user validation (for bots)
             Shop shop = shopService.getShopByIdForBotServices(shopId);
             
             // Verify customer exists
             Customer customer = null;
             if (customerId != null && !customerId.isEmpty()) {
-                // Try to find by phone (assuming customerId might be a phone number in messaging apps)
-                Optional<Customer> customerOpt = customerRepository.findByPhoneAndShopId(customerId, shopId);
-                if (customerOpt.isEmpty()) {
-                    // Try to find by email as a fallback
-                    customerOpt = customerRepository.findByEmailAndShopId(customerId, shopId);
-                }
+                // Generate email pattern for Telegram user
+                String customerEmail = "telegram_" + customerId + "@example.com";
+                
+                // Try to find by email pattern
+                Optional<Customer> customerOpt = customerRepository.findByEmailAndShopId(customerEmail, shopId);
                 if (customerOpt.isPresent()) {
                     customer = customerOpt.get();
                 } else {
@@ -833,8 +808,7 @@ public class ShopAIServiceImpl implements ShopAIService {
             }
             prompt.append("\n");
         }
-        
-        // Customer context with personalized approach
+          // Customer context with personalized approach
         if (customer != null) {
             prompt.append("CUSTOMER INFORMATION:\n");
             prompt.append("Name: ").append(customer.getFullname());
@@ -842,11 +816,27 @@ public class ShopAIServiceImpl implements ShopAIService {
             prompt.append("\nPhone: ").append(customer.getPhone());
             prompt.append("\nEmail: ").append(customer.getEmail());
             prompt.append("\n\n");
+            
+            // Add address validation context
+            String customerAddress = customer.getAddress();
+            if (customerAddress == null || customerAddress.isEmpty() || customerAddress.equals("Đang cập nhật")) {
+                prompt.append("IMPORTANT: Customer has NO VALID ADDRESS. For any PLACEORDER intent:\n");
+                prompt.append("- Set action_required: false\n");
+                prompt.append("- Add 'delivery_address' to missing_information\n");
+                prompt.append("- Ask for delivery address before processing order\n\n");
+            } else {
+                prompt.append("Customer has valid address for delivery.\n\n");
+            }
+            
             prompt.append("This is a returning customer. Use their name naturally and reference their previous interactions if relevant.\n\n");
         } else {
             prompt.append("NEW CUSTOMER:\n");
             prompt.append("Name: '").append(customerName).append("'\n");
-            prompt.append("This is a new customer. Be extra welcoming and take initiative to understand their needs.\n\n");
+            prompt.append("This is a new customer with NO ADDRESS INFORMATION. For any PLACEORDER intent:\n");
+            prompt.append("- Set action_required: false\n");
+            prompt.append("- Add 'delivery_address' to missing_information\n");
+            prompt.append("- Ask for delivery address before processing order\n");
+            prompt.append("Be extra welcoming and take initiative to understand their needs.\n\n");
         }
         
         // CRITICAL SESSION MANAGEMENT INSTRUCTION
@@ -897,18 +887,23 @@ public class ShopAIServiceImpl implements ShopAIService {
         prompt.append("6. ALWAYS extract and return any detected phone number in the 'extracted_phone' field\n");
         prompt.append("7. Example address detection: 'Giao hàng đến số 72 Hương An, Hương Trà, Thừa Thiên Huế nhé' → extracted_address: '72 Hương An, Hương Trà, Thừa Thiên Huế'\n");
         prompt.append("8. Example phone detection: 'Số điện thoại của mình là 0912345678' → extracted_phone: '0912345678'\n\n");
-        
-        // Thay thế phần ORDER PROCESSING GUIDELINES cũ
+          // Thay thế phần ORDER PROCESSING GUIDELINES cũ
         prompt.append("ORDER PROCESSING GUIDELINES (CRITICAL - FOLLOW EXACTLY):\n");
         prompt.append("When handling PLACEORDER intent (customer wants to buy something):\n");
-        prompt.append("1. ALWAYS include these fields in action_details:\n");
+        prompt.append("1. FIRST CHECK: Does customer have valid delivery address?\n");
+        prompt.append("   - If customer address is missing, null, empty, or 'Đang cập nhật': set action_required: false\n");
+        prompt.append("   - Add 'delivery_address' to missing_information array\n");
+        prompt.append("   - Ask customer for delivery address in response_text\n");
+        prompt.append("   - DO NOT create order until valid address is provided\n");
+        prompt.append("2. ONLY if customer has valid address, then include these fields in action_details:\n");
         prompt.append("   - product_id: The exact numeric ID of the product\n");
         prompt.append("   - quantity: The exact numeric quantity (default to 1 if unspecified)\n");
         prompt.append("   - action_type: Must be 'PLACEORDER'\n");
-        prompt.append("2. For products mentioned by name, match to a specific product_id from available products\n");
-        prompt.append("3. If multiple products are available, choose the most relevant one\n");
-        prompt.append("4. If product ID cannot be determined, put action_required: false\n");
-        prompt.append("5. Always confirm the order details in response_text\n\n");
+        prompt.append("3. For products mentioned by name, match to a specific product_id from available products\n");
+        prompt.append("4. If multiple products are available, choose the most relevant one\n");
+        prompt.append("5. If product ID cannot be determined, put action_required: false\n");
+        prompt.append("6. Always confirm the order details in response_text\n");
+        prompt.append("7. RULE: NEVER set action_required: true for PLACEORDER if missing_information contains any address-related field\n\n");
         
         // Add new section for order cancellation
         prompt.append("ORDER CANCELLATION GUIDELINES (CRITICAL - FOLLOW EXACTLY):\n");
@@ -1019,22 +1014,24 @@ public class ShopAIServiceImpl implements ShopAIService {
         prompt.append("   - action_type: 'PLACEORDER'\n");
         prompt.append("   - product_id: The ID of the product to order\n");
         prompt.append("   - quantity: The quantity to order\n\n");
-        
-        // Example for address response
-        prompt.append("Example - Address Response with Order (CRITICAL):\n");
-        prompt.append("If you previously asked for an address for a Cocacola order and customer says: 'Tôi ở 12 Đường Nguyễn Huệ, Quận 1, TP.HCM'\n");
+          // Example for address response
+        prompt.append("Example - Address Response with Order (CRITICAL - FOLLOW EXACTLY):\n");
+        prompt.append("Conversation context: Customer said 'mih muốn đặt 5 chai coca' then you asked for address\n");
+        prompt.append("Customer provides: 'mih ở 77 nguyễn huệ, thành phố huế. sdt của mih là 0327538428'\n");
         prompt.append("You MUST respond with:\n");
         prompt.append("{\n");
-        prompt.append("  \"response_text\": \"Cảm ơn bạn, mình đã nhận được địa chỉ: 12 Đường Nguyễn Huệ, Quận 1, TP.HCM. Mình sẽ ghi nhận và gửi đơn hàng Cocacola của bạn đến địa chỉ này ngay nhé!\",\n");
+        prompt.append("  \"response_text\": \"Dạ vâng, em đã nhận được địa chỉ giao hàng là 77 Nguyễn Huệ, thành phố Huế và số điện thoại 0327538428. Em đang tiến hành lên đơn 5 chai Coca-Cola giao đến địa chỉ này cho mình nhé.\",\n");
         prompt.append("  \"detected_intent\": \"ADDRESS_RESPONSE\",\n");
-        prompt.append("  \"extracted_address\": \"12 Đường Nguyễn Huệ, Quận 1, TP.HCM\",\n");
+        prompt.append("  \"extracted_address\": \"77 nguyễn huệ, thành phố huế\",\n");
+        prompt.append("  \"extracted_phone\": \"0327538428\",\n");
         prompt.append("  \"action_required\": true,\n");
         prompt.append("  \"create_order\": true,\n");
         prompt.append("  \"action_details\": {\n");
         prompt.append("    \"action_type\": \"PLACEORDER\",\n");
         prompt.append("    \"product_id\": 1,\n");
-        prompt.append("    \"quantity\": 1\n");
-        prompt.append("  }\n");
+        prompt.append("    \"quantity\": 5\n");
+        prompt.append("  },\n");
+        prompt.append("  \"needs_shop_context\": false\n");
         prompt.append("}\n\n");
         
         // Example for regular address response (no order needed)
@@ -1103,9 +1100,18 @@ public class ShopAIServiceImpl implements ShopAIService {
         prompt.append("Example 4 - Product Search:\n");
         prompt.append("Customer: 'Tôi muốn mua áo khoác'\n");
         prompt.append("Assistant: 'Dạ shop mình có nhiều mẫu áo khoác đẹp lắm ạ. Bạn thích phong cách nào? Áo khoác dù, áo khoác da, hay áo khoác len ấm? Mình có thể tư vấn cụ thể hơn cho bạn.'\n\n");
+          // Ví dụ 5: Đặt hàng THIẾU địa chỉ (CRITICAL EXAMPLE)
+        prompt.append("Example 5 - Order WITHOUT Address (CRITICAL - Customer address is missing):\n");
+        prompt.append("Customer: 'Tôi muốn mua 2 áo phông size L' (and customer address in database is 'Đang cập nhật')\n");
+        prompt.append("Response: {\n");
+        prompt.append("  \"response_text\": \"Dạ vâng, mình hiểu bạn muốn đặt 2 áo phông size L. Để hoàn tất đơn hàng, bạn vui lòng cho mình biết địa chỉ giao hàng là gì nhé?\",\n");
+        prompt.append("  \"detected_intent\": \"PLACEORDER\",\n");
+        prompt.append("  \"action_required\": false,\n");
+        prompt.append("  \"missing_information\": [\"delivery_address\"]\n");
+        prompt.append("}\n\n");
         
-        // Ví dụ 5: Đặt hàng có địa chỉ
-        prompt.append("Example 5 - Order with Address:\n");
+        // Ví dụ 6: Đặt hàng có địa chỉ
+        prompt.append("Example 6 - Order with Address:\n");
         prompt.append("Customer: 'Tôi muốn mua 2 áo phông size L giao đến 25 Nguyễn Thị Minh Khai, Q.1, TP.HCM'\n");
         prompt.append("Response: {\n");
         prompt.append("  \"response_text\": \"Dạ vâng, mình đã xác nhận đơn hàng 2 áo phông size L. Shop sẽ giao hàng đến địa chỉ 25 Nguyễn Thị Minh Khai, Quận 1, TP.HCM cho bạn nhé!\",\n");
@@ -1826,16 +1832,19 @@ public class ShopAIServiceImpl implements ShopAIService {
             prompt.append("3. If no order ID is mentioned, do NOT include the 'order_id' field\n");
             prompt.append("4. Set action_required: true for all cancellation requests\n");
             prompt.append("5. Always provide a clear confirmation in response_text\n\n");
-            
-            // Add specific instructions for ADDRESS_RESPONSE intent detection
+              // Add specific instructions for ADDRESS_RESPONSE intent detection
             prompt.append("IMPORTANT ADDRESS_RESPONSE GUIDELINES:\n");
             prompt.append("1. When customer is providing ONLY an address after you requested it:\n");
             prompt.append("   - Set detected_intent: 'ADDRESS_RESPONSE'\n");
             prompt.append("   - Set action_required: true\n");
             prompt.append("   - Set create_order: true if this address is for an order\n");
             prompt.append("   - Include extracted_address with the full address\n");
-            prompt.append("   - If this is for an order, include action_details with product_id and quantity\n");
-            prompt.append("2. Examples of address-only responses:\n");
+            prompt.append("   - CRITICAL: If this address is for an order and you previously asked for it, ALWAYS include action_details with:\n");
+            prompt.append("     * action_type: 'PLACEORDER'\n");
+            prompt.append("     * product_id: Extract from previous conversation (find the product the customer wanted to buy)\n");
+            prompt.append("     * quantity: Extract from previous conversation (find the quantity the customer wanted)\n");
+            prompt.append("2. Look through the conversation history to find what product and quantity the customer wanted to order\n");
+            prompt.append("3. Examples of address-only responses:\n");
             prompt.append("   - 'Địa chỉ của tôi là 123 Đường ABC'\n");
             prompt.append("   - 'Giao đến 72 Hương An, Huế nhé'\n");
             prompt.append("   - 'Nhà mình ở số 45 đường Trần Hưng Đạo'\n\n");

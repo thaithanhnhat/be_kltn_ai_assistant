@@ -24,47 +24,29 @@ import com.g18.assistant.dto.request.CreateOrderRequest;
 import com.g18.assistant.entity.Customer;
 import com.g18.assistant.repository.CustomerRepository;
 import com.g18.assistant.service.OrderService;
+import com.g18.assistant.service.PendingOrderService;
 
 import java.time.LocalDateTime;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 public class ShopTelegramBot extends TelegramLongPollingBot {
-    
-    private final Shop shop;
+      private final Shop shop;
     private final TelegramMessageRepository messageRepository;
     private final ShopAIService shopAIService;
     private final ObjectMapper objectMapper;
     private final CustomerRepository customerRepository;
     private final OrderService orderService;
+    private final PendingOrderService pendingOrderService;
     
     @Getter
     private boolean isRunning = false;
-    
-    // Add these fields to the class for pending orders
-    private final Map<String, PendingOrder> pendingOrders = new ConcurrentHashMap<>();
-    
-    // Inner class to store pending order details
-    private static class PendingOrder {
-        Long productId;
-        Integer quantity;
-        String note;
-        Long customerId;
-        
-        public PendingOrder(Long productId, Integer quantity, String note, Long customerId) {
-            this.productId = productId;
-            this.quantity = quantity;
-            this.note = note;
-            this.customerId = customerId;
-        }
-    }
-    
-    public ShopTelegramBot(String botToken, Shop shop, TelegramMessageRepository messageRepository, 
+      public ShopTelegramBot(String botToken, Shop shop, TelegramMessageRepository messageRepository, 
                            ShopAIService shopAIService, ObjectMapper objectMapper,
-                           CustomerRepository customerRepository, OrderService orderService) {
+                           CustomerRepository customerRepository, OrderService orderService,
+                           PendingOrderService pendingOrderService) {
         super(botToken);
         this.shop = shop;
         this.messageRepository = messageRepository;
@@ -72,6 +54,7 @@ public class ShopTelegramBot extends TelegramLongPollingBot {
         this.objectMapper = objectMapper;
         this.customerRepository = customerRepository;
         this.orderService = orderService;
+        this.pendingOrderService = pendingOrderService;
     }
     
     @Override
@@ -422,9 +405,7 @@ public class ShopTelegramBot extends TelegramLongPollingBot {
             log.error("Error retrieving product details: {}", e.getMessage(), e);
             return false;
         }
-    }
-
-    /**
+    }    /**
      * Xử lý đặt hàng
      * 
      * @param userId ID người dùng Telegram
@@ -439,20 +420,24 @@ public class ShopTelegramBot extends TelegramLongPollingBot {
             if (quantity == null) {
                 quantity = 1;
             }
+              // Tìm khách hàng trong hệ thống dựa trên userId Telegram với email pattern
+            // Lưu ý: Customer có thể đã được tạo bởi AI service trong processCustomerMessage
+            String customerEmail = "telegram_" + userId + "@example.com";
+            Customer customer = customerRepository.findByEmailAndShopId(customerEmail, shop.getId()).orElse(null);
             
-            // Tìm khách hàng trong hệ thống dựa trên userId Telegram
-            Customer customer = customerRepository.findByPhoneAndShopId(userId, shop.getId())
-                .orElseGet(() -> {
-                    // Nếu không tìm thấy, tạo khách hàng mới với địa chỉ tạm thời
-                    Customer newCustomer = new Customer();
-                    newCustomer.setPhone(userId);
-                    newCustomer.setShop(shop);
-                    newCustomer.setFullname("Telegram User " + userId);
-                    // Đặt một địa chỉ tạm thời để tránh lỗi null
-                    newCustomer.setAddress("Đang cập nhật");
-                    newCustomer.setEmail("telegram_" + userId + "@example.com");
-                    return customerRepository.save(newCustomer);
-                });
+            // Nếu không tìm thấy customer, có nghĩa là có lỗi logic vì AI service đã phải tạo customer trước đó
+            if (customer == null) {
+                log.warn("Customer not found for email {} in shop {}. This should not happen as AI service should have created the customer.", customerEmail, shop.getId());
+                // Tạo customer mới như một fallback
+                customer = new Customer();
+                customer.setPhone(userId);
+                customer.setShop(shop);
+                customer.setFullname("Telegram User " + userId);
+                customer.setAddress("Đang cập nhật");
+                customer.setEmail(customerEmail);
+                customer = customerRepository.save(customer);
+                log.info("Created fallback customer with ID: {} for userId: {}", customer.getId(), userId);
+            }
             
             // Nếu không có productId, thông báo lỗi
             if (productId == null) {
@@ -466,21 +451,8 @@ public class ShopTelegramBot extends TelegramLongPollingBot {
                 sendTextMessage(chatId, "Xin lỗi, không tìm thấy sản phẩm với ID: " + productId);
                 return;
             }
-            
-            // Kiểm tra xem khách hàng đã có địa chỉ thật chưa hay vẫn đang dùng địa chỉ mặc định
-            if ("Đang cập nhật".equals(customer.getAddress())) {
-                // Lưu thông tin đơn hàng chờ để xử lý sau khi có địa chỉ
-                pendingOrders.put(userId, new PendingOrder(productId, quantity, note, customer.getId()));
-                
-                // Gửi thông báo yêu cầu cung cấp địa chỉ - cách tiếp cận tự nhiên hơn
-                sendTextMessage(chatId, 
-                    "Tuyệt vời! Mình đã nhận được đơn đặt " + quantity + " " + product.getName() + " của bạn. " +
-                    "Để shop có thể giao hàng, bạn cho mình xin địa chỉ nhận hàng được không ạ?");
-                
-                return;
-            }
-            
-            // Tạo yêu cầu đặt hàng
+              // AI service đã đảm bảo customer có địa chỉ hợp lệ trước khi gọi processPlaceOrder
+            // Tạo đơn hàng ngay lập tức
             CreateOrderRequest orderRequest = new CreateOrderRequest();
             orderRequest.setCustomerId(customer.getId());
             orderRequest.setProductId(productId);
@@ -521,11 +493,13 @@ public class ShopTelegramBot extends TelegramLongPollingBot {
      * @param userId ID người dùng Telegram
      * @param chatId ID chat Telegram
      * @param address Địa chỉ mới của khách hàng
-     */
-    private void processAddressUpdate(String userId, Long chatId, String address) {
+     */    private void processAddressUpdate(String userId, Long chatId, String address) {
         try {
-            // Tìm khách hàng để cập nhật địa chỉ
-            Customer customer = customerRepository.findByPhoneAndShopId(userId, shop.getId())
+            // Generate email pattern for Telegram user
+            String customerEmail = "telegram_" + userId + "@example.com";
+            
+            // Tìm khách hàng bằng email pattern để cập nhật địa chỉ
+            Customer customer = customerRepository.findByEmailAndShopId(customerEmail, shop.getId())
                 .orElse(null);
                 
             if (customer == null) {
@@ -536,21 +510,23 @@ public class ShopTelegramBot extends TelegramLongPollingBot {
             // Cập nhật địa chỉ khách hàng
             customer.setAddress(address);
             customerRepository.save(customer);
-            
-            sendTextMessage(chatId, "✅ Đã cập nhật địa chỉ giao hàng thành công!");
+              sendTextMessage(chatId, "✅ Đã cập nhật địa chỉ giao hàng thành công!");
             
             // Kiểm tra xem có đơn hàng đang chờ không
-            PendingOrder pendingOrder = pendingOrders.remove(userId);
+            PendingOrderService.PendingOrderInfo pendingOrder = pendingOrderService.getPendingOrder(userId);
             if (pendingOrder != null) {
                 // Tạo đơn hàng với địa chỉ mới
                 CreateOrderRequest orderRequest = new CreateOrderRequest();
-                orderRequest.setCustomerId(pendingOrder.customerId);
-                orderRequest.setProductId(pendingOrder.productId);
-                orderRequest.setQuantity(pendingOrder.quantity);
-                orderRequest.setNote(pendingOrder.note);
+                orderRequest.setCustomerId(pendingOrder.getCustomerId());
+                orderRequest.setProductId(pendingOrder.getProductId());
+                orderRequest.setQuantity(pendingOrder.getQuantity());
+                orderRequest.setNote(pendingOrder.getNote());
                 
                 // Gọi service để tạo đơn hàng
                 OrderDTO createdOrder = orderService.createOrder(orderRequest);
+                
+                // Remove the pending order after successful creation
+                pendingOrderService.removePendingOrder(userId);
                 
                 // Gửi xác nhận đơn hàng
                 String confirmationMessage = String.format(

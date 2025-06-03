@@ -8,6 +8,7 @@ import com.g18.assistant.repository.CustomerRepository;
 import com.g18.assistant.service.ShopAIService;
 import com.g18.assistant.service.ShopService;
 import com.g18.assistant.service.OrderService;
+import com.g18.assistant.service.PendingOrderService;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
@@ -27,13 +28,13 @@ import java.util.concurrent.ConcurrentHashMap;
 @Component
 @RequiredArgsConstructor
 public class TelegramBotManager {
-    
-    private final ShopService shopService;
+      private final ShopService shopService;
     private final TelegramMessageRepository messageRepository;
     private final ShopAIService shopAIService;
     private final ObjectMapper objectMapper;
     private final CustomerRepository customerRepository;
     private final OrderService orderService;
+    private final PendingOrderService pendingOrderService;
     
     private TelegramBotsApi telegramBotsApi;
     private final Map<Long, ShopTelegramBot> activeBots = new ConcurrentHashMap<>();
@@ -73,8 +74,7 @@ public class TelegramBotManager {
             return true;
         }
         
-        try {
-            // Create and register the bot with the new dependencies
+        try {            // Create and register the bot with the new dependencies
             ShopTelegramBot bot = new ShopTelegramBot(
                 token, 
                 shop, 
@@ -82,7 +82,8 @@ public class TelegramBotManager {
                 shopAIService, 
                 objectMapper,
                 customerRepository,
-                orderService
+                orderService,
+                pendingOrderService
             );
             boolean success = bot.start(telegramBotsApi);
             
