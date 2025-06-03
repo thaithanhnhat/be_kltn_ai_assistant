@@ -17,4 +17,5 @@ public interface OrderService {
     List<OrderDTO> getOrdersByDateRange(Long shopId, LocalDateTime startDate, LocalDateTime endDate);
     OrderDTO updateOrderStatus(Long id, UpdateOrderStatusRequest request);
     void deleteOrder(Long id);
-} 
+    List<OrderDTO> findRecentOrdersByCustomerAndProduct(Long customerId, Long productId, LocalDateTime afterTime);
+}

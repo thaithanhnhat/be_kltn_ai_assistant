@@ -129,8 +129,7 @@ public class OrderServiceImpl implements OrderService {
         Order updatedOrder = orderRepository.save(order);
         return orderMapper.toDTO(updatedOrder);
     }
-    
-    @Override
+      @Override
     @Transactional
     public void deleteOrder(Long id) {
         Order order = orderRepository.findById(id)
@@ -145,4 +144,12 @@ public class OrderServiceImpl implements OrderService {
         
         orderRepository.delete(order);
     }
-} 
+    
+    @Override
+    public List<OrderDTO> findRecentOrdersByCustomerAndProduct(Long customerId, Long productId, LocalDateTime afterTime) {
+        List<Order> orders = orderRepository.findRecentOrdersByCustomerAndProduct(customerId, productId, afterTime);
+        return orders.stream()
+                .map(orderMapper::toDTO)
+                .collect(Collectors.toList());
+    }
+}
