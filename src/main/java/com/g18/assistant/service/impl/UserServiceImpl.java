@@ -246,4 +246,27 @@ public class UserServiceImpl implements UserService {
                 .orElseThrow(() -> new UsernameNotFoundException("User not found"));
         return user.getBalance();
     }
-} 
+    
+    @Override
+    @Transactional
+    public Double deductBalance(String username, Double amount) {
+        if (amount == null || amount <= 0) {
+            throw new IllegalArgumentException("Deduction amount must be positive");
+        }
+        
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() -> new UsernameNotFoundException("User not found"));
+        
+        Double currentBalance = user.getBalance();
+        if (currentBalance < amount) {
+            throw new IllegalArgumentException("Insufficient balance. Current balance: " + currentBalance + " VND, Required: " + amount + " VND");
+        }
+        
+        Double newBalance = currentBalance - amount;
+        user.setBalance(newBalance);
+        userRepository.save(user);
+        
+        log.info("Deducted {} VND from user {}'s balance. New balance: {} VND", amount, username, newBalance);
+        return newBalance;
+    }
+}
