@@ -36,6 +36,14 @@ public interface ProductRepository extends JpaRepository<Product, Long> {
      */
     Page<Product> findByShopId(Long shopId, Pageable pageable);
     
+    /**
+     * Find all products belonging to a shop (for deletion purposes)
+     * 
+     * @param shopId The shop ID
+     * @return List of all products
+     */
+    List<Product> findByShopId(Long shopId);
+    
     @Query("SELECT p FROM Product p WHERE p.shop.id = :shopId AND p.active = true AND " +
            "(LOWER(p.name) LIKE LOWER(CONCAT('%', :keyword, '%')) OR " +
            "LOWER(p.description) LIKE LOWER(CONCAT('%', :keyword, '%')) OR " +

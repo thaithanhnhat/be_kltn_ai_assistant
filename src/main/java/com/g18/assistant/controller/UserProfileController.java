@@ -1,9 +1,11 @@
 package com.g18.assistant.controller;
 
 import com.g18.assistant.dto.request.UserProfileUpdateRequest;
+import com.g18.assistant.dto.request.BalanceDeductionRequest;
 import com.g18.assistant.dto.response.UserResponse;
 import com.g18.assistant.dto.response.BalanceResponse;
 import com.g18.assistant.service.UserService;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -32,6 +34,29 @@ public class UserProfileController {
         Double balance = userService.getUserBalance(username);
         return ResponseEntity.ok(new BalanceResponse(balance));
     }
+    @PostMapping("/balance/deduct")
+    public ResponseEntity<Boolean> deductBalance(
+            @AuthenticationPrincipal Jwt jwt,
+            @Valid @RequestBody BalanceDeductionRequest request) {
+        try {
+            String username = jwt.getSubject();
+            userService.deductBalance(username, request.getAmount());
+            return ResponseEntity.ok(true);
+        } catch (Exception e) {
+            log.error("Error deducting balance for user: {}", jwt.getSubject(), e);
+            return ResponseEntity.ok(false);
+        }
+    }@PostMapping("/balance/deduct-fixed")
+    public ResponseEntity<Boolean> deductFixedAmount(@AuthenticationPrincipal Jwt jwt) {
+        try {
+            String username = jwt.getSubject();
+            userService.deductBalance(username, 520000.0);
+            return ResponseEntity.ok(true);
+        } catch (Exception e) {
+            log.error("Error deducting fixed amount for user: {}", jwt.getSubject(), e);
+            return ResponseEntity.ok(false);
+        }
+    }
 
     @PutMapping
     public ResponseEntity<UserResponse> updateProfile(
@@ -41,4 +66,4 @@ public class UserProfileController {
         UserResponse updatedUser = userService.updateProfile(username, request);
         return ResponseEntity.ok(updatedUser);
     }
-} 
+}

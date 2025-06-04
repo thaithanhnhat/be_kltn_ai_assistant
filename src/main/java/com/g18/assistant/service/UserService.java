@@ -76,4 +76,14 @@ public interface UserService {
      * @return The user's current balance in VND
      */
     Double getUserBalance(String username);
-} 
+    
+    /**
+     * Deduct a specified amount from a user's balance
+     * 
+     * @param username The username of the user
+     * @param amount The amount to deduct in VND
+     * @return The updated user balance
+     * @throws IllegalArgumentException if user not found or insufficient balance
+     */
+    Double deductBalance(String username, Double amount);
+}
