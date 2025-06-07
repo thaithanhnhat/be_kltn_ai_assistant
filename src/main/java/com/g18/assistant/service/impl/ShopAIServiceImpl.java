@@ -58,9 +58,8 @@ public class ShopAIServiceImpl implements ShopAIService {
     private String geminiChatModel;
       @Value("${app.gemini.api-url}")
     private String geminiApiUrl;
-    
-    @Override
-    public String processCustomerMessage(Long shopId, String customerId, String customerName, String message) {
+      @Override
+    public String processCustomerMessage(Long shopId, String customerId, String customerName, String message, String platform) {
         try {
             // Track if an order has been created for this message to prevent duplicates
             boolean orderCreated = false;
@@ -74,11 +73,11 @@ public class ShopAIServiceImpl implements ShopAIService {
               // Find or create a customer record
             Customer customer = null;
             
-            // For Telegram users, use email pattern: telegram_{username}@example.com
+            // Use platform-specific email pattern
             String customerEmail = null;
             if (customerId != null && !customerId.isEmpty()) {
-                // Generate email pattern for Telegram user
-                customerEmail = "telegram_" + customerId + "@example.com";
+                // Generate email pattern based on platform
+                customerEmail = platform.toLowerCase() + "_" + customerId + "@example.com";
                 
                 // Try to find by email pattern first
                 customer = customerService.findByEmailAndShopId(customerEmail, shopId);
@@ -854,18 +853,16 @@ public class ShopAIServiceImpl implements ShopAIService {
             log.error("Error getting product recommendations: {}", e.getMessage(), e);
             return createErrorResponse("Error finding products: " + e.getMessage());
         }
-    }
-
-    @Override
-    public String processOrderRequest(Long shopId, String customerId, String orderRequest) {        try {
+    }    @Override
+    public String processOrderRequest(Long shopId, String customerId, String orderRequest, String platform) {        try {
             // Get shop information without user validation (for bots)
             Shop shop = shopService.getShopByIdForBotServices(shopId);
             
             // Verify customer exists
             Customer customer = null;
             if (customerId != null && !customerId.isEmpty()) {
-                // Generate email pattern for Telegram user
-                String customerEmail = "telegram_" + customerId + "@example.com";
+                // Generate email pattern based on platform
+                String customerEmail = platform.toLowerCase() + "_" + customerId + "@example.com";
                 
                 // Try to find by email pattern
                 Optional<Customer> customerOpt = customerRepository.findByEmailAndShopId(customerEmail, shopId);

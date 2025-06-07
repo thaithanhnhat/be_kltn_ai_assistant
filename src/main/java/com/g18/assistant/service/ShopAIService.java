@@ -6,17 +6,17 @@ import com.g18.assistant.entity.Product;
  * Service for handling AI-powered chat interactions for shop bots
  */
 public interface ShopAIService {
-    
-    /**
+      /**
      * Process a customer message through Gemini AI and return a structured response
      * 
      * @param shopId The ID of the shop
      * @param customerId The ID of the customer (or null if not registered)
      * @param customerName The name of the customer
      * @param message The message from the customer
+     * @param platform The platform from which the message originates (e.g., "facebook", "telegram")
      * @return Structured AI response with action recommendations
      */
-    String processCustomerMessage(Long shopId, String customerId, String customerName, String message);
+    String processCustomerMessage(Long shopId, String customerId, String customerName, String message, String platform);
     
     /**
      * Get product recommendations based on customer query
@@ -26,16 +26,16 @@ public interface ShopAIService {
      * @return JSON-formatted product recommendations
      */
     String getProductRecommendations(Long shopId, String customerQuery);
-    
-    /**
+      /**
      * Process order-related requests through AI
      * 
      * @param shopId The ID of the shop
      * @param customerId The ID of the customer
      * @param orderRequest The order request details
+     * @param platform The platform from which the request originates (e.g., "facebook", "telegram")
      * @return JSON-formatted order processing response
      */
-    String processOrderRequest(Long shopId, String customerId, String orderRequest);
+    String processOrderRequest(Long shopId, String customerId, String orderRequest, String platform);
     
     /**
      * Get customer info required for completing an order

@@ -134,9 +134,8 @@ public class ShopTelegramBot extends TelegramLongPollingBot {
                     shop.getId(), messageText);
 
             // Process message with Gemini AI
-            try {
-                // Call AI service to get response
-                String aiResponse = shopAIService.processCustomerMessage(shop.getId(), userId, username, messageText);
+            try {                // Call AI service to get response
+                String aiResponse = shopAIService.processCustomerMessage(shop.getId(), userId, username, messageText, "telegram");
                 
                 // Parse the AI response
                 JsonNode responseJson = objectMapper.readTree(aiResponse);

@@ -5,6 +5,7 @@ D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\
 D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\repository\AccessTokenRepository.java
 D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\repository\FeedbackRepository.java
 D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\controller\CustomerController.java
+D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\repository\FacebookMessageLogRepository.java
 D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\service\PasswordResetService.java
 D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\repository\OrderRepository.java
 D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\service\impl\PendingOrderServiceImpl.java
@@ -118,6 +119,7 @@ D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\
 D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\controller\AuthController.java
 D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\service\impl\GeminiAiServiceImpl.java
 D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\AssistantApplication.java
+D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\entity\FacebookMessageLog.java
 D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\service\impl\CustomerServiceImpl.java
 D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\controller\PaymentController.java
 D:\tailieuhoc\KLTN\BE_KLTN\be_kltn_ai_assistant\src\main\java\com\g18\assistant\mapper\OrderMapper.java

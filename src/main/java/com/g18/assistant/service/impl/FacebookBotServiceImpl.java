@@ -247,10 +247,9 @@ public class FacebookBotServiceImpl implements FacebookBotService {
                         try {
                             // Get user's real name for better AI interaction
                             String userName = getFacebookUserName(shopId, senderId);
-                            
-                            // Call our AI service to get a response
+                              // Call our AI service to get a response
                             String aiResponse = shopAIService.processCustomerMessage(
-                                    shopId, senderId, userName, messageText);
+                                    shopId, senderId, userName, messageText, "facebook");
                             
                             // Parse the AI response
                             JsonNode responseJson = objectMapper.readTree(aiResponse);
