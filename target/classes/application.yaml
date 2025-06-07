@@ -108,7 +108,7 @@ app:
   
   # Ngrok URL for Facebook webhooks (only applied to Facebook)
   ngrok:
-    url: ${NGROK_URL:https://b194-116-98-249-135.ngrok-free.app}
+    url: ${NGROK_URL:https://d57b-116-98-249-135.ngrok-free.app}
 
   # BNB Testnet settings
   bnb:

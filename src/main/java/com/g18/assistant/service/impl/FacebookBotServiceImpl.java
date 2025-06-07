@@ -161,11 +161,14 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                 .verifyToken(tokenEntity.getVerifyToken())
                 .build();
     }
-    
-    @Override
+      @Override
     public void handleIncomingMessage(String requestBody) {
+        log.info("=== PROCESSING FACEBOOK MESSAGE ===");
+        log.info("Raw request body: {}", requestBody);
+        
         try {
             FacebookMessageDto messageDto = objectMapper.readValue(requestBody, FacebookMessageDto.class);
+            log.info("Parsed message object: {}", messageDto.getObject());
             
             if (messageDto.getObject() == null || !messageDto.getObject().equals("page")) {
                 log.warn("Received non-page event: {}", messageDto.getObject());
@@ -176,15 +179,27 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                 log.warn("No entries in the webhook event");
                 return;
             }
+            
+            log.info("Processing {} entries", messageDto.getEntries().size());
 
             // Process each messaging event
             for (FacebookMessageDto.Entry entry : messageDto.getEntries()) {
+                log.info("Processing entry ID: {}", entry.getId());
+                
                 if (entry.getMessaging() == null || entry.getMessaging().isEmpty()) {
+                    log.warn("No messaging events in entry");
                     continue;
                 }
+                
+                log.info("Processing {} messaging events", entry.getMessaging().size());
 
                 for (FacebookMessageDto.Messaging messaging : entry.getMessaging()) {
+                    log.info("Processing messaging event: sender={}, recipient={}", 
+                            messaging.getSender() != null ? messaging.getSender().getId() : "null",
+                            messaging.getRecipient() != null ? messaging.getRecipient().getId() : "null");
+                    
                     if (messaging.getMessage() == null || messaging.getMessage().getText() == null) {
+                        log.warn("Message or text is null, skipping");
                         continue;
                     }
 
@@ -196,6 +211,7 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                     
                     // Get the shop ID from page ID
                     Long shopId = findShopIdByPageId(recipientId);
+                    log.info("Found shop ID {} for page ID {}", shopId, recipientId);
                     
                     if (shopId != null) {
                         // Check if this is an address command
@@ -593,14 +609,17 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
             }
         }
     }
-    
-    private void subscribeToWebhook(String accessToken) {
+      private void subscribeToWebhook(String accessToken) {
         String url = facebookApiUrl + "/me/subscribed_apps?access_token=" + accessToken;
         
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         
-        HttpEntity<String> entity = new HttpEntity<>("{}", headers);
+        // Create request body with required subscribed_fields parameter
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("subscribed_fields", "messages,messaging_postbacks");
+        
+        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
         
         try {
             restTemplate.exchange(url, HttpMethod.POST, entity, String.class);

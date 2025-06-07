@@ -90,15 +90,24 @@ public class FacebookBotController {
         }
         
         return ResponseEntity.badRequest().build();
-    }
-
-    /**
+    }    /**
      * Webhook endpoint that receives messages from Facebook
      */
     @PostMapping("/webhook/{shopId}")
     @Operation(summary = "Receive Facebook messages", description = "Webhook endpoint that receives messages from Facebook Messenger")
     public ResponseEntity<Void> receiveMessage(@PathVariable Long shopId, @RequestBody String requestBody) {
-        facebookBotService.handleIncomingMessage(requestBody);
+        log.info("=== FACEBOOK WEBHOOK RECEIVED ===");
+        log.info("Shop ID: {}", shopId);
+        log.info("Request Body: {}", requestBody);
+        log.info("===============================");
+        
+        try {
+            facebookBotService.handleIncomingMessage(requestBody);
+            log.info("Successfully processed Facebook webhook for shop {}", shopId);
+        } catch (Exception e) {
+            log.error("Error processing Facebook webhook for shop {}: {}", shopId, e.getMessage(), e);
+        }
+        
         return ResponseEntity.ok().build();
     }
 
