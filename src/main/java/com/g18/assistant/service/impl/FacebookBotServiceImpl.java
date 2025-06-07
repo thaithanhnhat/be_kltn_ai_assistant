@@ -33,16 +33,17 @@ import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
 import java.security.SecureRandom;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.Base64;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
 
 @Service
 @RequiredArgsConstructor
 @Slf4j
-public class FacebookBotServiceImpl implements FacebookBotService {    private final FacebookAccessTokenRepository facebookAccessTokenRepository;
+public class FacebookBotServiceImpl implements FacebookBotService {
+    
+    private final FacebookAccessTokenRepository facebookAccessTokenRepository;
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
     private final ShopAIService shopAIService;
@@ -50,6 +51,13 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
     private final CustomerRepository customerRepository;
     private final OrderService orderService;
     private final PendingOrderService pendingOrderService;
+
+    // Message deduplication cache - prevents processing duplicate messages within 5 minutes
+    private final ConcurrentHashMap<String, Long> processedMessages = new ConcurrentHashMap<>();
+    private static final long MESSAGE_CACHE_DURATION_MS = TimeUnit.MINUTES.toMillis(5);
+    
+    // Customer creation synchronization to prevent race conditions
+    private final ConcurrentHashMap<String, Object> customerCreationLocks = new ConcurrentHashMap<>();
 
     @Value("${app.facebook.api.url:https://graph.facebook.com/v18.0}")
     private String facebookApiUrl;
@@ -154,6 +162,47 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                 .webhookUrl(tokenEntity.getWebhookUrl())                .build();
     }
     
+    /**
+     * Checks if a message has already been processed recently to prevent duplicate processing
+     */
+    private boolean isMessageAlreadyProcessed(String messageId, String senderId) {
+        String key = senderId + ":" + messageId;
+        long currentTime = System.currentTimeMillis();
+        
+        // Clean expired entries periodically to prevent memory leaks
+        cleanupExpiredCaches(currentTime);
+        
+        // Check if this message was already processed
+        Long lastProcessedTime = processedMessages.get(key);
+        if (lastProcessedTime != null && (currentTime - lastProcessedTime) < MESSAGE_CACHE_DURATION_MS) {
+            log.info("Message already processed recently for sender {}, message {}", senderId, messageId);
+            return true;
+        }
+        
+        // Mark as processed
+        processedMessages.put(key, currentTime);
+        return false;
+    }
+    
+    /**
+     * Clean up expired cache entries to prevent memory leaks
+     */
+    private void cleanupExpiredCaches(long currentTime) {
+        // Clean expired processed messages
+        processedMessages.entrySet().removeIf(entry -> 
+            currentTime - entry.getValue() > MESSAGE_CACHE_DURATION_MS);
+        
+        // Clean up customer creation locks that are older than 1 minute (should be very fast operations)
+        // This is a safety measure in case locks are not properly cleaned up
+        if (currentTime % 60000 < 1000) { // Run cleanup roughly once per minute
+            int initialSize = customerCreationLocks.size();
+            if (initialSize > 100) { // Only clean if there are many locks accumulated
+                customerCreationLocks.clear();
+                log.info("Cleaned up {} customer creation locks to prevent memory leak", initialSize);
+            }
+        }
+    }
+    
     @Override
     public void handleIncomingMessage(String requestBody) {
         try {
@@ -173,9 +222,7 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
             for (FacebookMessageDto.Entry entry : messageDto.getEntries()) {
                 if (entry.getMessaging() == null || entry.getMessaging().isEmpty()) {
                     continue;
-                }
-
-                for (FacebookMessageDto.Messaging messaging : entry.getMessaging()) {
+                }                for (FacebookMessageDto.Messaging messaging : entry.getMessaging()) {
                     if (messaging.getMessage() == null || messaging.getMessage().getText() == null) {
                         continue;
                     }
@@ -183,28 +230,27 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                     String senderId = messaging.getSender().getId();
                     String recipientId = messaging.getRecipient().getId();
                     String messageText = messaging.getMessage().getText();
+                    String messageId = messaging.getMessage().getMid(); // Get message ID for deduplication
                     
-                    log.info("Received Facebook message from {}: {}", senderId, messageText);
+                    // Check for duplicate message processing
+                    if (isMessageAlreadyProcessed(messageId != null ? messageId : String.valueOf(messageText.hashCode()), senderId)) {
+                        log.info("Skipping duplicate message from {}", senderId);
+                        continue;
+                    }
+                    
+                    log.info("Processing Facebook message from {}: {}", senderId, messageText);
                     
                     // Get the shop ID from page ID
                     Long shopId = findShopIdByPageId(recipientId);
-                    
-                    if (shopId != null) {
-                        // Check if this is an address command
-                        if (messageText.startsWith("/address ")) {
-                            String address = messageText.substring(9).trim(); // Extract address after "/address "
-                            if (!address.isEmpty()) {
-                                // Process address update
-                                processAddressUpdate(shopId, senderId, address);
-                                continue; // Skip AI processing for address commands
-                            }
-                        }
-                        
+                      if (shopId != null) {
                         // Process message with AI service
                         try {
+                            // Get user's real name for better AI interaction
+                            String userName = getFacebookUserName(shopId, senderId);
+                            
                             // Call our AI service to get a response
                             String aiResponse = shopAIService.processCustomerMessage(
-                                    shopId, senderId, "Facebook User", messageText);
+                                    shopId, senderId, userName, messageText);
                             
                             // Parse the AI response
                             JsonNode responseJson = objectMapper.readTree(aiResponse);
@@ -250,8 +296,7 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                                         log.error("Error showing product details: {}", e.getMessage(), e);
                                     }
                                 }
-                                
-                                // Handle PLACEORDER action type
+                                  // Handle PLACEORDER action type
                                 if (actionDetails.has("action_type") && 
                                     "PLACEORDER".equals(actionDetails.get("action_type").asText())) {
                                     
@@ -278,6 +323,54 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                                         }
                                     } catch (Exception e) {
                                         log.error("Error processing place order: {}", e.getMessage(), e);
+                                    }
+                                }
+                                  // Handle ADDRESS_UPDATE action type
+                                if (actionDetails.has("action_type") && 
+                                    "ADDRESS_UPDATE".equals(actionDetails.get("action_type").asText()) &&
+                                    actionDetails.has("address")) {
+                                    
+                                    try {
+                                        String address = actionDetails.get("address").asText();
+                                        if (address != null && !address.trim().isEmpty()) {
+                                            processAddressUpdate(shopId, senderId, address.trim());
+                                        }
+                                    } catch (Exception e) {
+                                        log.error("Error processing address update: {}", e.getMessage(), e);
+                                    }
+                                }
+                                
+                                // Handle COMPLETE_ORDER action type (when AI has all info including address)
+                                if (actionDetails.has("action_type") && 
+                                    "COMPLETE_ORDER".equals(actionDetails.get("action_type").asText())) {
+                                    
+                                    try {
+                                        Long productId = null;
+                                        Integer quantity = null;
+                                        String note = null;
+                                        String address = null;
+                                        
+                                        if (actionDetails.has("product_id")) {
+                                            productId = actionDetails.get("product_id").asLong();
+                                        }
+                                        
+                                        if (actionDetails.has("quantity")) {
+                                            quantity = actionDetails.get("quantity").asInt();
+                                        }
+                                        
+                                        if (actionDetails.has("note")) {
+                                            note = actionDetails.get("note").asText();
+                                        }
+                                        
+                                        if (actionDetails.has("address")) {
+                                            address = actionDetails.get("address").asText();
+                                        }
+                                        
+                                        if (productId != null && quantity != null && address != null && !address.trim().isEmpty()) {
+                                            processCompleteOrder(shopId, senderId, productId, quantity, note, address.trim());
+                                        }
+                                    } catch (Exception e) {
+                                        log.error("Error processing complete order: {}", e.getMessage(), e);
                                     }
                                 }
                             }
@@ -472,73 +565,22 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
         } catch (Exception e) {
             log.error("Error sending image message to Facebook: {}", e.getMessage(), e);
         }
-    }
-
-    /**
+    }    /**
      * Process order placement for Facebook user
      */
     private void processPlaceOrder(Long shopId, String senderId, Long productId, Integer quantity, String note) {
         try {
-            // Generate email pattern for Facebook user
-            String customerEmail = "facebook_" + senderId + "@example.com";
+            // Find or create customer using safe method to prevent race conditions
+            Customer customer = findOrCreateFacebookCustomer(shopId, senderId);
             
-            // Find or create customer
-            Customer customer = customerRepository.findByEmailAndShopId(customerEmail, shopId)
-                .orElse(null);
-                
-            if (customer == null) {
-                log.warn("Customer not found for Facebook user {} in shop {}. Creating new customer.", senderId, shopId);                // Create new customer
-                customer = Customer.builder()                        .phone(senderId)
-                        .shop(shopService.getShopByIdForBotServices(shopId))
-                        .fullname("Facebook User #" + senderId)
-                        .email(customerEmail)
-                        .address("") // Will be updated when provided
-                        .build();
-                customer = customerRepository.save(customer);
-                log.info("Created new customer for Facebook user: {}", senderId);
-            }
-              // Get product information from service, not direct entity access
-            // Using the shopAIService to get product details
-            Product product = null;
-            try {
-                // Try to get product through AI service which handles shop validation
-                String productQuery = "product " + productId;
-                String aiResponse = shopAIService.processCustomerMessage(shopId, "system", "System", productQuery);
-                JsonNode responseJson = objectMapper.readTree(aiResponse);
-                
-                // For now, we'll use a simpler approach - assume product exists if AI can process it
-                // In a real implementation, you'd want a proper product service method
-                product = new Product(); // Placeholder - you'd get actual product data
-                product.setName("Product #" + productId);
-                product.setPrice(BigDecimal.valueOf(100000.0)); // Placeholder price
-            } catch (Exception e) {
-                log.warn("Could not get product details for product {}: {}", productId, e.getMessage());
-            }
-              if (product == null) {
+            // Get product information
+            Product product = shopAIService.getProductById(shopId, productId);
+            if (product == null) {
                 sendMessage(shopId, senderId, "Xin lỗi, tôi không thể tìm thấy sản phẩm có ID: " + productId);
                 return;
-            }
-            
-            // Check if customer has address
-            if (customer.getAddress() == null || customer.getAddress().trim().isEmpty()) {
-                // Store pending order with the correct parameter order
-                pendingOrderService.storePendingOrder(senderId, customer.getId(), productId, quantity, PendingOrderService.OrderSource.AI_CHAT);
-                
-                String message = String.format(
-                    "📦 Tôi rất vui được đặt hàng cho bạn!\n\n" +
-                    "🛍️ Sản phẩm: %s\n" +
-                    "🔢 Số lượng: %d\n" +
-                    "💰 Tổng cộng: %s VND\n\n" +
-                    "📍 Để hoàn tất đơn hàng, vui lòng cung cấp địa chỉ giao hàng bằng cách nhập:\n" +
-                    "/address [Địa chỉ đầy đủ của bạn]",
-                    product.getName(),
-                    quantity,
-                    String.format("%,.0f", product.getPrice().multiply(BigDecimal.valueOf(quantity)))
-                );
-                
-                sendMessage(shopId, senderId, message);
-                return;
-            }
+            }            // Check if customer has address - if not, create order without address validation
+            // AI will handle address collection in its natural conversation flow
+            boolean hasAddress = customer.getAddress() != null && !customer.getAddress().trim().isEmpty();
             
             // Check for recent duplicate orders
             java.time.LocalDateTime recentTime = java.time.LocalDateTime.now().minusSeconds(30);
@@ -549,7 +591,7 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                 log.info("Found recent order for customer {} and product {}, preventing duplicate creation", 
                     customer.getId(), productId);
                 
-                OrderDTO existingOrder = recentOrders.get(0);                String confirmationMessage = String.format(
+                OrderDTO existingOrder = recentOrders.get(0);String confirmationMessage = String.format(
                     "✅ Đơn hàng của bạn đã được xử lý thành công!\n\n" +
                     "🔢 Mã đơn hàng: #%d\n" +
                     "🛍️ Sản phẩm: %s\n" +
@@ -575,50 +617,41 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                     .note(note)
                     .build();
             
-            OrderDTO createdOrder = orderService.createOrder(orderRequest);
-              // Send confirmation
-            String confirmationMessage = String.format(
-                "✅ Đơn hàng đã được tạo thành công!\n\n" +
-                "🔢 Mã đơn hàng: #%d\n" +
-                "🛍️ Sản phẩm: %s\n" +
-                "🔢 Số lượng: %d\n" +
-                "💰 Tổng cộng: %s VND\n" +
-                "📦 Địa chỉ giao hàng: %s\n\n" +
-                "Cảm ơn bạn đã đặt hàng! Chúng tôi sẽ xử lý đơn hàng sớm nhất có thể.",
-                createdOrder.getId(),
-                product.getName(),
-                createdOrder.getQuantity(),
-                String.format("%,.0f", product.getPrice().multiply(BigDecimal.valueOf(quantity))),
-                customer.getAddress()
-            );
+            OrderDTO createdOrder = orderService.createOrder(orderRequest);            // Send confirmation message
+            StringBuilder confirmationBuilder = new StringBuilder();
+            confirmationBuilder.append("✅ Đơn hàng đã được tạo thành công!\n\n");
+            confirmationBuilder.append(String.format("🔢 Mã đơn hàng: #%d\n", createdOrder.getId()));
+            confirmationBuilder.append(String.format("🛍️ Sản phẩm: %s\n", product.getName()));
+            confirmationBuilder.append(String.format("🔢 Số lượng: %d\n", createdOrder.getQuantity()));
+            confirmationBuilder.append(String.format("💰 Tổng cộng: %s VND\n", 
+                String.format("%,.0f", product.getPrice().multiply(BigDecimal.valueOf(quantity)))));
             
-            sendMessage(shopId, senderId, confirmationMessage);
+            if (hasAddress) {
+                confirmationBuilder.append(String.format("📦 Địa chỉ giao hàng: %s\n", customer.getAddress()));
+            } else {
+                confirmationBuilder.append("📦 Địa chỉ giao hàng: Chưa cập nhật\n");
+            }
+            
+            confirmationBuilder.append("\nCảm ơn bạn đã đặt hàng! Chúng tôi sẽ xử lý đơn hàng sớm nhất có thể.");
+            
+            sendMessage(shopId, senderId, confirmationBuilder.toString());
             log.info("Created order {} for Facebook user {} in shop {}", createdOrder.getId(), senderId, shopId);
               } catch (Exception e) {
             log.error("Error processing order for Facebook user {}: {}", senderId, e.getMessage(), e);
             sendMessage(shopId, senderId, "Xin lỗi, đã có lỗi khi xử lý đơn hàng của bạn. Vui lòng thử lại sau.");
         }
-    }
-
-    /**
+    }    /**
      * Process address update for Facebook user and complete pending orders
      */
     private void processAddressUpdate(Long shopId, String senderId, String address) {
         try {
-            // Generate email pattern for Facebook user
-            String customerEmail = "facebook_" + senderId + "@example.com";
-            
-            // Find customer by email pattern to update address
-            Customer customer = customerRepository.findByEmailAndShopId(customerEmail, shopId)
-                .orElse(null);
-                  if (customer == null) {
-                sendMessage(shopId, senderId, "Xin lỗi, tôi không thể tìm thấy thông tin khách hàng của bạn.");
-                return;
-            }
+            // Find or create customer using safe method to prevent race conditions
+            Customer customer = findOrCreateFacebookCustomer(shopId, senderId);
             
             // Update customer address
             customer.setAddress(address);
             customerRepository.save(customer);
+            log.info("Updated address for Facebook user: {}", senderId);
             
             sendMessage(shopId, senderId, "✅ Địa chỉ đã được cập nhật thành công!");
             
@@ -656,11 +689,132 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                 );
                 
                 sendMessage(shopId, senderId, confirmationMessage);
-            }
-        } catch (Exception e) {
+            }        } catch (Exception e) {
             log.error("Error updating address for Facebook user {}: {}", senderId, e.getMessage(), e);
             sendMessage(shopId, senderId, "Đã có lỗi khi cập nhật địa chỉ của bạn: " + e.getMessage());
+        }    }    /**
+     * Process complete order (when AI has all info including address)
+     */
+    private void processCompleteOrder(Long shopId, String senderId, Long productId, Integer quantity, String note, String address) {
+        try {
+            // Find or create customer using safe method to prevent race conditions
+            Customer customer = findOrCreateFacebookCustomer(shopId, senderId);
+            
+            // Update customer address
+            customer.setAddress(address);
+            customerRepository.save(customer);
+            
+            // Get product information
+            Product product = shopAIService.getProductById(shopId, productId);
+            if (product == null) {
+                sendMessage(shopId, senderId, "Xin lỗi, tôi không thể tìm thấy sản phẩm có ID: " + productId);
+                return;
+            }
+            
+            // Check for recent duplicate orders
+            java.time.LocalDateTime recentTime = java.time.LocalDateTime.now().minusSeconds(30);
+            List<OrderDTO> recentOrders = orderService.findRecentOrdersByCustomerAndProduct(
+                customer.getId(), productId, recentTime);
+            
+            if (!recentOrders.isEmpty()) {
+                log.info("Found recent order for customer {} and product {}, preventing duplicate creation", 
+                    customer.getId(), productId);
+                
+                OrderDTO existingOrder = recentOrders.get(0);
+                String confirmationMessage = String.format(
+                    "✅ Đơn hàng của bạn đã được xử lý thành công!\n\n" +
+                    "🔢 Mã đơn hàng: #%d\n" +
+                    "🛍️ Sản phẩm: %s\n" +
+                    "🔢 Số lượng: %d\n" +
+                    "🏷️ Trạng thái: %s\n" +
+                    "🏠 Địa chỉ giao hàng: %s\n\n" +
+                    "Cảm ơn bạn đã đặt hàng!",
+                    existingOrder.getId(),
+                    product.getName(),
+                    existingOrder.getQuantity(),
+                    existingOrder.getStatus(),
+                    address
+                );
+                
+                sendMessage(shopId, senderId, confirmationMessage);
+                return;
+            }
+            
+            // Create the order using proper builder pattern
+            CreateOrderRequest orderRequest = CreateOrderRequest.builder()
+                    .customerId(customer.getId())
+                    .productId(productId)
+                    .quantity(quantity)
+                    .note(note)
+                    .build();
+            
+            OrderDTO createdOrder = orderService.createOrder(orderRequest);
+            
+            // Send confirmation
+            String confirmationMessage = String.format(
+                "✅ Đơn hàng đã được tạo thành công!\n\n" +
+                "🔢 Mã đơn hàng: #%d\n" +
+                "🛍️ Sản phẩm: %s\n" +
+                "🔢 Số lượng: %d\n" +
+                "💰 Tổng cộng: %s VND\n" +
+                "🏠 Địa chỉ giao hàng: %s\n\n" +
+                "Cảm ơn bạn đã đặt hàng! Chúng tôi sẽ xử lý đơn hàng sớm nhất có thể.",
+                createdOrder.getId(),
+                product.getName(),
+                createdOrder.getQuantity(),
+                String.format("%,.0f", product.getPrice().multiply(BigDecimal.valueOf(quantity))),
+                address
+            );
+            
+            sendMessage(shopId, senderId, confirmationMessage);
+            log.info("Created complete order {} for Facebook user {} in shop {}", createdOrder.getId(), senderId, shopId);
+            
+        } catch (Exception e) {
+            log.error("Error processing complete order for Facebook user {}: {}", senderId, e.getMessage(), e);
+            sendMessage(shopId, senderId, "Xin lỗi, đã có lỗi khi xử lý đơn hàng của bạn. Vui lòng thử lại sau.");
         }
+    }
+
+    /**
+     * Get Facebook user's real name from Graph API
+     */
+    private String getFacebookUserName(Long shopId, String userId) {
+        try {
+            FacebookAccessToken tokenEntity = facebookAccessTokenRepository.findByShopIdAndActive(shopId, true)
+                .orElse(null);
+            
+            if (tokenEntity == null) {
+                log.warn("No active Facebook token found for shop {}, using default name", shopId);
+                return "Facebook User #" + userId;
+            }
+            
+            // Call Facebook Graph API to get user info
+            String url = facebookApiUrl + "/" + userId + "?fields=first_name,last_name&access_token=" + tokenEntity.getAccessToken();
+            
+            try {
+                String response = restTemplate.getForObject(url, String.class);
+                
+                if (response != null) {
+                    JsonNode userInfo = objectMapper.readTree(response);
+                    String firstName = userInfo.has("first_name") ? userInfo.get("first_name").asText() : "";
+                    String lastName = userInfo.has("last_name") ? userInfo.get("last_name").asText() : "";
+                    
+                    if (!firstName.isEmpty() || !lastName.isEmpty()) {
+                        String fullName = (firstName + " " + lastName).trim();
+                        log.info("Retrieved Facebook user name: {} for user ID: {}", fullName, userId);
+                        return fullName;
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("Failed to get Facebook user info for user {}: {}", userId, e.getMessage());
+            }
+            
+        } catch (Exception e) {
+            log.error("Error getting Facebook user name for user {}: {}", userId, e.getMessage(), e);
+        }
+        
+        // Fallback to default name if API call fails
+        return "Facebook User #" + userId;
     }
 
     // Helper method to find a shop ID from a Facebook page ID
@@ -719,8 +873,81 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
             log.error("Error subscribing to Facebook webhook: {}", e.getMessage(), e);
             throw new RuntimeException("Failed to subscribe to Facebook webhook", e);
         }
+    }    /**
+     * Safely find or create Facebook customer to prevent race conditions
+     */
+    private Customer findOrCreateFacebookCustomer(Long shopId, String senderId) {
+        String customerEmail = "facebook_" + senderId + "@example.com";
+        String lockKey = shopId + ":" + senderId;
+        
+        // Try to find existing customer first
+        Customer customer = customerRepository.findByEmailAndShopId(customerEmail, shopId)
+                .orElse(null);
+        
+        if (customer != null) {
+            // Update existing customer info in case user name changed
+            String currentName = getFacebookUserName(shopId, senderId);
+            if (!currentName.equals(customer.getFullname())) {
+                customer.setFullname(currentName);
+                customer.setPhone(senderId);
+                customerRepository.save(customer);
+                log.info("Updated customer info for Facebook user: {}", senderId);
+            }
+            return customer;
+        }
+        
+        // Customer doesn't exist, use per-user synchronization to prevent race conditions
+        Object lock = customerCreationLocks.computeIfAbsent(lockKey, k -> new Object());
+        
+        synchronized (lock) {
+            // Double-check pattern: check again inside synchronized block
+            customer = customerRepository.findByEmailAndShopId(customerEmail, shopId)
+                    .orElse(null);
+            
+            if (customer != null) {
+                log.info("Customer already created by another thread for Facebook user: {}", senderId);
+                // Clean up lock after use
+                customerCreationLocks.remove(lockKey);
+                return customer;
+            }
+            
+            // Create new customer
+            try {
+                log.info("Creating new customer for Facebook user {} in shop {}", senderId, shopId);
+                
+                customer = Customer.builder()
+                        .phone(senderId)
+                        .shop(shopService.getShopByIdForBotServices(shopId))
+                        .fullname(getFacebookUserName(shopId, senderId))
+                        .email(customerEmail)
+                        .address("") // Will be updated when provided
+                        .build();
+                
+                customer = customerRepository.save(customer);
+                log.info("Successfully created new customer for Facebook user: {}", senderId);
+                
+                // Clean up lock after successful creation
+                customerCreationLocks.remove(lockKey);
+                return customer;
+                
+            } catch (Exception e) {
+                // Handle constraint violation (duplicate email) - another thread might have created the customer
+                log.warn("Failed to create customer (likely due to race condition), retrying find for Facebook user {}: {}", 
+                        senderId, e.getMessage());
+                
+                // Try to find the customer that was created by another thread
+                customer = customerRepository.findByEmailAndShopId(customerEmail, shopId)
+                        .orElseThrow(() -> new RuntimeException("Failed to find or create customer for Facebook user: " + senderId));
+                
+                log.info("Found customer created by another thread for Facebook user: {}", senderId);
+                
+                // Clean up lock after resolution
+                customerCreationLocks.remove(lockKey);
+                return customer;
+            }
+        }
     }
-    
+
     private String generateRandomToken() {
         byte[] randomBytes = new byte[32];
         new SecureRandom().nextBytes(randomBytes);
