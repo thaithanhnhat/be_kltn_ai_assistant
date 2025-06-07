@@ -5,15 +5,14 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.List;
+
 @Data
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class FacebookBotStatusDto {
+public class FacebookWebhookListDto {
     private Long shopId;
+    private List<FacebookWebhookConfigDto> webhooks;
     private boolean active;
-    private String webhookUrl;
-    private String pageId;
-    private boolean hasAccessToken;
-    private String verifyToken;
 }
