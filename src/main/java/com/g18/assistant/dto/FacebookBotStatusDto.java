@@ -13,7 +13,4 @@ public class FacebookBotStatusDto {
     private Long shopId;
     private boolean active;
     private String webhookUrl;
-    private String pageId;
-    private boolean hasAccessToken;
-    private String verifyToken;
-}
+} 

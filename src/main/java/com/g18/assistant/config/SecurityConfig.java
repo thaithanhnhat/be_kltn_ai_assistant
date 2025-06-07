@@ -16,7 +16,6 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.data.redis.core.RedisTemplate;
 import com.g18.assistant.service.RateLimiter;
 import com.g18.assistant.service.impl.RedisRateLimiter;
-import com.g18.assistant.config.CustomJwtDecoder;
 import lombok.RequiredArgsConstructor;
 import java.util.List;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
@@ -34,11 +33,12 @@ public class SecurityConfig {
         "/v3/api-docs/**",       // Swagger documentation
         "/swagger-ui/**",
         "/swagger-ui.html"
-    };    private static final String[] API_PROTECTED = {
+    };
+
+    private static final String[] API_PROTECTED = {
         "/api/profile/**",        // User profile endpoints
         "/api/payments/**",       // Payment endpoints
-        "/api/integration/**",    // Integration token endpoints
-        "/api/facebook-pages/**"  // Facebook page management endpoints
+        "/api/integration/**"     // Integration token endpoints
     };
 
     @Bean

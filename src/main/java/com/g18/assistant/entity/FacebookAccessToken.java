@@ -22,23 +22,18 @@ public class FacebookAccessToken {
     
     @Column(nullable = false)
     private Long shopId;
-      @Column(name = "page_id", nullable = false)
-    private String pageId;
     
-    @Column(name = "page_name")
-    private String pageName;
+    @Column(name = "page_id")
+    private String pageId;
     
     @Column(length = 2000, nullable = false)
     private String accessToken;
     
-    @Column(nullable = false)
+    @Column
     private String verifyToken;
     
     @Column
     private String webhookUrl;
-    
-    @Column(name = "subscribed_events")
-    private String subscribedEvents; // JSON array of subscribed events
     
     @Column(name = "is_active")
     private boolean active;

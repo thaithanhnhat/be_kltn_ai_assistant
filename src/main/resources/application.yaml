@@ -74,41 +74,18 @@ app:
     # Model for chat interactions - updated to latest model that handles structured outputs well
     chat-model-id: gemini-2.5-flash-preview-04-17
     api-url: https://generativelanguage.googleapis.com/v1beta/models
+
   # Facebook Bot Configuration
   facebook:
     api:
       url: https://graph.facebook.com/v18.0
-      version: v18.0
-      timeout: 30000 # 30 seconds
-      retry:
-        max-attempts: 3
-        delay: 1000 # 1 second
-    webhook:
-      # Default webhook settings
-      default-events: messages,messaging_postbacks,message_deliveries,message_reads
-      verify-token-length: 32
-      challenge-timeout: 30000 # 30 seconds
-    pages:
-      # Maximum pages per shop
-      max-pages-per-shop: 10
-      # Token validation
-      validate-tokens: true
-      # Auto-subscribe new pages
-      auto-subscribe: true
-    monitoring:
-      # Enable message logging
-      log-messages: true
-      # Log webhook events
-      log-webhook-events: true
-      # Performance monitoring
-      track-response-time: true
     # Base URL for webhooks
   base:
     url: ${BASE_URL:http://localhost:8080/assistant}
   
   # Ngrok URL for Facebook webhooks (only applied to Facebook)
   ngrok:
-    url: ${NGROK_URL:https://d57b-116-98-249-135.ngrok-free.app}
+    url: ${NGROK_URL:https://b194-116-98-249-135.ngrok-free.app}
 
   # BNB Testnet settings
   bnb:

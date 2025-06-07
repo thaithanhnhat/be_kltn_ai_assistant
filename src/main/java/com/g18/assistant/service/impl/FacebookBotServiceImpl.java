@@ -13,33 +13,31 @@ import com.g18.assistant.entity.Product;
 import com.g18.assistant.repository.CustomerRepository;
 import com.g18.assistant.repository.FacebookAccessTokenRepository;
 import com.g18.assistant.service.FacebookBotService;
-import com.g18.assistant.service.FacebookMonitoringService;
 import com.g18.assistant.service.OrderService;
 import com.g18.assistant.service.PendingOrderService;
 import com.g18.assistant.service.ShopAIService;
 import com.g18.assistant.service.ShopService;
-import com.g18.assistant.service.impl.FacebookPageValidationService;
 import jakarta.persistence.EntityNotFoundException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
 import java.security.SecureRandom;
-import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -48,14 +46,10 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
     private final ShopAIService shopAIService;
-    private final ShopService shopService;    private final CustomerRepository customerRepository;
+    private final ShopService shopService;
+    private final CustomerRepository customerRepository;
     private final OrderService orderService;
     private final PendingOrderService pendingOrderService;
-    private final FacebookPageValidationService facebookPageValidationService;
-    
-    // Optional monitoring service - may not be available in all environments
-    @Autowired(required = false)
-    private FacebookMonitoringService facebookMonitoringService;
 
     @Value("${app.facebook.api.url:https://graph.facebook.com/v18.0}")
     private String facebookApiUrl;
@@ -147,7 +141,9 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
         
         // Unsubscribe from webhook events if needed
         // unsubscribeFromWebhook(tokenEntity.getAccessToken());
-    }    @Override
+    }
+
+    @Override
     public FacebookBotStatusDto getBotStatus(Long shopId) {
         FacebookAccessToken tokenEntity = facebookAccessTokenRepository.findByShopId(shopId)
                 .orElseThrow(() -> new EntityNotFoundException("Facebook configuration not found for shop: " + shopId));
@@ -155,20 +151,13 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
         return FacebookBotStatusDto.builder()
                 .shopId(shopId)
                 .active(tokenEntity.isActive())
-                .webhookUrl(tokenEntity.getWebhookUrl())
-                .pageId(tokenEntity.getPageId())
-                .hasAccessToken(tokenEntity.getAccessToken() != null && !tokenEntity.getAccessToken().isEmpty())
-                .verifyToken(tokenEntity.getVerifyToken())
-                .build();
+                .webhookUrl(tokenEntity.getWebhookUrl())                .build();
     }
-      @Override
+    
+    @Override
     public void handleIncomingMessage(String requestBody) {
-        log.info("=== PROCESSING FACEBOOK MESSAGE ===");
-        log.info("Raw request body: {}", requestBody);
-        
         try {
             FacebookMessageDto messageDto = objectMapper.readValue(requestBody, FacebookMessageDto.class);
-            log.info("Parsed message object: {}", messageDto.getObject());
             
             if (messageDto.getObject() == null || !messageDto.getObject().equals("page")) {
                 log.warn("Received non-page event: {}", messageDto.getObject());
@@ -179,27 +168,15 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                 log.warn("No entries in the webhook event");
                 return;
             }
-            
-            log.info("Processing {} entries", messageDto.getEntries().size());
 
             // Process each messaging event
             for (FacebookMessageDto.Entry entry : messageDto.getEntries()) {
-                log.info("Processing entry ID: {}", entry.getId());
-                
                 if (entry.getMessaging() == null || entry.getMessaging().isEmpty()) {
-                    log.warn("No messaging events in entry");
                     continue;
                 }
-                
-                log.info("Processing {} messaging events", entry.getMessaging().size());
 
                 for (FacebookMessageDto.Messaging messaging : entry.getMessaging()) {
-                    log.info("Processing messaging event: sender={}, recipient={}", 
-                            messaging.getSender() != null ? messaging.getSender().getId() : "null",
-                            messaging.getRecipient() != null ? messaging.getRecipient().getId() : "null");
-                    
                     if (messaging.getMessage() == null || messaging.getMessage().getText() == null) {
-                        log.warn("Message or text is null, skipping");
                         continue;
                     }
 
@@ -211,7 +188,6 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                     
                     // Get the shop ID from page ID
                     Long shopId = findShopIdByPageId(recipientId);
-                    log.info("Found shop ID {} for page ID {}", shopId, recipientId);
                     
                     if (shopId != null) {
                         // Check if this is an address command
@@ -223,38 +199,20 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                                 continue; // Skip AI processing for address commands
                             }
                         }
-                          // Process message with AI service
+                        
+                        // Process message with AI service
                         try {
-                            long startTime = System.currentTimeMillis();
-                            
                             // Call our AI service to get a response
                             String aiResponse = shopAIService.processCustomerMessage(
                                     shopId, senderId, "Facebook User", messageText);
                             
-                            long processingTime = System.currentTimeMillis() - startTime;
-                            
                             // Parse the AI response
                             JsonNode responseJson = objectMapper.readTree(aiResponse);
-                            
-                            // Extract intent and confidence for monitoring
-                            String detectedIntent = responseJson.has("detected_intent") ? 
-                                    responseJson.get("detected_intent").asText() : null;
-                            Double confidence = responseJson.has("confidence") ? 
-                                    responseJson.get("confidence").asDouble() : null;
-                              // Log incoming message if monitoring is available
-                            try {
-                                if (facebookMonitoringService != null) {
-                                    facebookMonitoringService.logIncomingMessage(shopId, recipientId, senderId, recipientId, 
-                                            messageText, detectedIntent, confidence, processingTime);
-                                }
-                            } catch (Exception monitoringException) {
-                                log.debug("Monitoring service unavailable: {}", monitoringException.getMessage());
-                            }
                             
                             // Check if there was an error
                             if (responseJson.has("error") && responseJson.get("error").asBoolean()) {
                                 log.error("AI error: {}", responseJson.get("message").asText());
-                                sendMessage(shopId, senderId, "I'm sorry, I'm having trouble understanding your request right now. Please try again later.");
+                                sendMessage(shopId, senderId, "Xin lỗi, tôi đang gặp khó khăn trong việc hiểu yêu cầu của bạn. Vui lòng thử lại sau.");
                                 return;
                             }
                             
@@ -326,7 +284,7 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                             
                         } catch (Exception e) {
                             log.error("Error processing message with AI: {}", e.getMessage(), e);
-                            sendMessage(shopId, senderId, "I'm sorry, I couldn't process your request. Please try again later.");
+                            sendMessage(shopId, senderId, "Xin lỗi, tôi không thể xử lý yêu cầu của bạn. Vui lòng thử lại sau.");
                         }
                     } else {
                         log.warn("Could not find shop for page ID: {}", recipientId);
@@ -341,21 +299,178 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
      */
     private void sendProductDetails(Long shopId, String recipientId, Long productId) {
         try {
-            // For now, send a generic product message since we don't have direct product access
-            // In a real implementation, you'd want a proper product service method
-            String productMessage = String.format(
-                "🛍️ Product Information (ID: %d)\n\n" +
-                "For detailed product information, please visit our shop or contact us directly.\n\n" +
-                "Would you like to place an order for this product?", 
-                productId
-            );
+            // Get product details from the database using shopAIService
+            Product product = shopAIService.getProductById(shopId, productId);
+            if (product == null) {
+                sendMessage(shopId, recipientId, "Xin lỗi, tôi không thể tìm thấy sản phẩm này.");
+                return;
+            }
             
-            sendMessage(shopId, recipientId, productMessage);
+            // Create detailed product description in Vietnamese
+            StringBuilder detailsBuilder = new StringBuilder();
+            detailsBuilder.append("🛍️ ").append(product.getName()).append("\n\n");
+            detailsBuilder.append("💰 Giá: ").append(String.format("%,.0f", product.getPrice())).append(" VND\n");
+            detailsBuilder.append("🏷️ Danh mục: ").append(product.getCategory()).append("\n");
+            
+            if (product.getStock() > 0) {
+                detailsBuilder.append("✅ Còn hàng: ").append(product.getStock()).append(" sản phẩm\n");
+            } else {
+                detailsBuilder.append("❌ Hết hàng\n");
+            }
+            
+            detailsBuilder.append("\n📝 Mô tả: ").append(product.getDescription());
+            detailsBuilder.append("\n\nBạn có muốn đặt hàng sản phẩm này không?");
+            
+            String detailsText = detailsBuilder.toString();
+            
+            // If the product has an image, send with image
+            if (product.getImageBase64() != null && !product.getImageBase64().isEmpty()) {
+                sendProductImage(shopId, recipientId, product, detailsText);
+            } else {
+                // If no image, just send text details
+                sendMessage(shopId, recipientId, detailsText);
+            }
+            
             log.info("Sent product details for product {} to Facebook user {}", productId, recipientId);
+              } catch (Exception e) {
+            log.error("Error sending product details to Facebook user {}: {}", recipientId, e.getMessage(), e);
+            sendMessage(shopId, recipientId, "Xin lỗi, tôi không thể lấy thông tin chi tiết sản phẩm.");
+        }
+    }
+
+    /**
+     * Send product image with details to a Facebook user using Facebook's proper image upload
+     */
+    private void sendProductImage(Long shopId, String recipientId, Product product, String caption) {
+        try {
+            FacebookAccessToken tokenEntity = facebookAccessTokenRepository.findByShopIdAndActive(shopId, true)
+                .orElseThrow(() -> new EntityNotFoundException("Active Facebook configuration not found for shop: " + shopId));
+            
+            String url = facebookApiUrl + "/me/messages?access_token=" + tokenEntity.getAccessToken();
+            
+            // First send image using proper Facebook API
+            sendImageAttachment(shopId, recipientId, product.getImageBase64());
+            
+            // Then send the caption as a separate text message
+            if (caption != null && !caption.trim().isEmpty()) {
+                // Small delay to ensure proper message ordering
+                Thread.sleep(500);
+                sendMessage(shopId, recipientId, caption);
+            }
             
         } catch (Exception e) {
-            log.error("Error sending product details to Facebook user {}: {}", recipientId, e.getMessage(), e);
-            sendMessage(shopId, recipientId, "I'm sorry, I couldn't retrieve the product details.");
+            log.error("Error sending product image to Facebook user {}: {}", recipientId, e.getMessage(), e);
+            // Fallback to text message if image sending fails
+            sendMessage(shopId, recipientId, caption);
+        }
+    }    /**
+     * Send image attachment to Facebook using proper file upload
+     */
+    private void sendImageAttachment(Long shopId, String recipientId, String imageBase64) {
+        try {
+            FacebookAccessToken tokenEntity = facebookAccessTokenRepository.findByShopIdAndActive(shopId, true)
+                .orElseThrow(() -> new EntityNotFoundException("Active Facebook configuration not found for shop: " + shopId));
+            
+            // Step 1: Upload the image to Facebook first
+            String attachmentId = uploadImageToFacebookAPI(tokenEntity.getAccessToken(), imageBase64);
+            
+            if (attachmentId != null) {
+                // Step 2: Send message with uploaded attachment
+                sendImageMessage(shopId, recipientId, attachmentId);
+            } else {
+                log.warn("Failed to upload image to Facebook, skipping image sending");
+            }
+            
+        } catch (Exception e) {
+            log.error("Error preparing image attachment for Facebook: {}", e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Upload image to Facebook and get attachment ID
+     */
+    private String uploadImageToFacebookAPI(String accessToken, String imageBase64) {
+        try {
+            String uploadUrl = facebookApiUrl + "/me/message_attachments?access_token=" + accessToken;
+            
+            // Convert base64 to byte array
+            byte[] imageBytes = java.util.Base64.getDecoder().decode(imageBase64);
+            
+            // Create multipart form data
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+              // Create the file part
+            ByteArrayResource fileResource = new ByteArrayResource(imageBytes) {
+                @Override
+                public String getFilename() {
+                    return "product-image.jpg";
+                }
+            };
+            
+            MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+            body.add("message", "{\"attachment\":{\"type\":\"image\",\"payload\":{\"is_reusable\":true}}}");
+            body.add("filedata", fileResource);
+            
+            HttpEntity<MultiValueMap<String, Object>> requestEntity = 
+                new HttpEntity<>(body, headers);
+            
+            // Upload the image
+            String response = restTemplate.postForObject(uploadUrl, requestEntity, String.class);
+            
+            if (response != null) {
+                // Parse response to get attachment_id
+                JsonNode responseJson = objectMapper.readTree(response);
+                if (responseJson.has("attachment_id")) {
+                    String attachmentId = responseJson.get("attachment_id").asText();
+                    log.info("Successfully uploaded image to Facebook with attachment ID: {}", attachmentId);
+                    return attachmentId;
+                }
+            }
+            
+        } catch (Exception e) {
+            log.error("Error uploading image to Facebook API: {}", e.getMessage(), e);
+        }
+        
+        return null;
+    }
+
+    /**
+     * Send message with uploaded image attachment
+     */
+    private void sendImageMessage(Long shopId, String recipientId, String attachmentId) {
+        try {
+            FacebookAccessToken tokenEntity = facebookAccessTokenRepository.findByShopIdAndActive(shopId, true)
+                .orElseThrow(() -> new EntityNotFoundException("Active Facebook configuration not found for shop: " + shopId));
+            
+            String url = facebookApiUrl + "/me/messages?access_token=" + tokenEntity.getAccessToken();
+            
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            
+            Map<String, Object> recipientMap = new HashMap<>();
+            recipientMap.put("id", recipientId);
+            
+            Map<String, Object> payloadMap = new HashMap<>();
+            payloadMap.put("attachment_id", attachmentId);
+            
+            Map<String, Object> attachmentMap = new HashMap<>();
+            attachmentMap.put("type", "image");
+            attachmentMap.put("payload", payloadMap);
+            
+            Map<String, Object> messageMap = new HashMap<>();
+            messageMap.put("attachment", attachmentMap);
+            
+            Map<String, Object> requestBody = new HashMap<>();
+            requestBody.put("recipient", recipientMap);
+            requestBody.put("message", messageMap);
+            
+            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
+            
+            restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
+            log.info("Successfully sent image message to Facebook user {}", recipientId);
+            
+        } catch (Exception e) {
+            log.error("Error sending image message to Facebook: {}", e.getMessage(), e);
         }
     }
 
@@ -399,23 +514,24 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
             } catch (Exception e) {
                 log.warn("Could not get product details for product {}: {}", productId, e.getMessage());
             }
-            
-            if (product == null) {
-                sendMessage(shopId, senderId, "Sorry, I couldn't find that product with ID: " + productId);
+              if (product == null) {
+                sendMessage(shopId, senderId, "Xin lỗi, tôi không thể tìm thấy sản phẩm có ID: " + productId);
                 return;
             }
             
             // Check if customer has address
-            if (customer.getAddress() == null || customer.getAddress().trim().isEmpty()) {            // Store pending order with the correct parameter order
-            pendingOrderService.storePendingOrder(senderId, customer.getId(), productId, quantity, PendingOrderService.OrderSource.AI_CHAT);
+            if (customer.getAddress() == null || customer.getAddress().trim().isEmpty()) {
+                // Store pending order with the correct parameter order
+                pendingOrderService.storePendingOrder(senderId, customer.getId(), productId, quantity, PendingOrderService.OrderSource.AI_CHAT);
                 
                 String message = String.format(
-                    "📦 I'd be happy to place this order for you!\n\n" +
-                    "🛍️ Product: %s\n" +
-                    "🔢 Quantity: %d\n" +
-                    "💰 Total: %s VND\n\n" +
-                    "📍 To complete your order, please provide your delivery address by typing:\n" +
-                    "/address [Your full address]",                    product.getName(),
+                    "📦 Tôi rất vui được đặt hàng cho bạn!\n\n" +
+                    "🛍️ Sản phẩm: %s\n" +
+                    "🔢 Số lượng: %d\n" +
+                    "💰 Tổng cộng: %s VND\n\n" +
+                    "📍 Để hoàn tất đơn hàng, vui lòng cung cấp địa chỉ giao hàng bằng cách nhập:\n" +
+                    "/address [Địa chỉ đầy đủ của bạn]",
+                    product.getName(),
                     quantity,
                     String.format("%,.0f", product.getPrice().multiply(BigDecimal.valueOf(quantity)))
                 );
@@ -433,15 +549,14 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                 log.info("Found recent order for customer {} and product {}, preventing duplicate creation", 
                     customer.getId(), productId);
                 
-                OrderDTO existingOrder = recentOrders.get(0);
-                String confirmationMessage = String.format(
-                    "✅ Your order has been processed successfully!\n\n" +
-                    "🔢 Order ID: #%d\n" +
-                    "🛍️ Product: %s\n" +
-                    "🔢 Quantity: %d\n" +
-                    "🏷️ Status: %s\n\n" +
-                    "📦 Delivery address: %s\n\n" +
-                    "Thank you for your order!",
+                OrderDTO existingOrder = recentOrders.get(0);                String confirmationMessage = String.format(
+                    "✅ Đơn hàng của bạn đã được xử lý thành công!\n\n" +
+                    "🔢 Mã đơn hàng: #%d\n" +
+                    "🛍️ Sản phẩm: %s\n" +
+                    "🔢 Số lượng: %d\n" +
+                    "🏷️ Trạng thái: %s\n\n" +
+                    "📦 Địa chỉ giao hàng: %s\n\n" +
+                    "Cảm ơn bạn đã đặt hàng!",
                     existingOrder.getId(),
                     product.getName(),
                     existingOrder.getQuantity(),
@@ -461,28 +576,27 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                     .build();
             
             OrderDTO createdOrder = orderService.createOrder(orderRequest);
-            
-            // Send confirmation
+              // Send confirmation
             String confirmationMessage = String.format(
-                "✅ Order created successfully!\n\n" +
-                "🔢 Order ID: #%d\n" +
-                "🛍️ Product: %s\n" +
-                "🔢 Quantity: %d\n" +
-                "💰 Total: %s VND\n" +
-                "📦 Delivery address: %s\n\n" +
-                "Thank you for your order! We'll process it soon.",
+                "✅ Đơn hàng đã được tạo thành công!\n\n" +
+                "🔢 Mã đơn hàng: #%d\n" +
+                "🛍️ Sản phẩm: %s\n" +
+                "🔢 Số lượng: %d\n" +
+                "💰 Tổng cộng: %s VND\n" +
+                "📦 Địa chỉ giao hàng: %s\n\n" +
+                "Cảm ơn bạn đã đặt hàng! Chúng tôi sẽ xử lý đơn hàng sớm nhất có thể.",
                 createdOrder.getId(),
-                product.getName(),                createdOrder.getQuantity(),
+                product.getName(),
+                createdOrder.getQuantity(),
                 String.format("%,.0f", product.getPrice().multiply(BigDecimal.valueOf(quantity))),
                 customer.getAddress()
             );
             
             sendMessage(shopId, senderId, confirmationMessage);
             log.info("Created order {} for Facebook user {} in shop {}", createdOrder.getId(), senderId, shopId);
-            
-        } catch (Exception e) {
+              } catch (Exception e) {
             log.error("Error processing order for Facebook user {}: {}", senderId, e.getMessage(), e);
-            sendMessage(shopId, senderId, "I'm sorry, there was an error processing your order. Please try again later.");
+            sendMessage(shopId, senderId, "Xin lỗi, đã có lỗi khi xử lý đơn hàng của bạn. Vui lòng thử lại sau.");
         }
     }
 
@@ -497,9 +611,8 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
             // Find customer by email pattern to update address
             Customer customer = customerRepository.findByEmailAndShopId(customerEmail, shopId)
                 .orElse(null);
-                
-            if (customer == null) {
-                sendMessage(shopId, senderId, "Sorry, I couldn't find your customer information.");
+                  if (customer == null) {
+                sendMessage(shopId, senderId, "Xin lỗi, tôi không thể tìm thấy thông tin khách hàng của bạn.");
                 return;
             }
             
@@ -507,17 +620,18 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
             customer.setAddress(address);
             customerRepository.save(customer);
             
-            sendMessage(shopId, senderId, "✅ Address updated successfully!");
+            sendMessage(shopId, senderId, "✅ Địa chỉ đã được cập nhật thành công!");
             
             // Check if there's a pending order
             PendingOrderService.PendingOrderInfo pendingOrder = pendingOrderService.getPendingOrder(senderId);
-            if (pendingOrder != null) {            // Create order request using builder pattern
-            CreateOrderRequest orderRequest = CreateOrderRequest.builder()
-                    .customerId(pendingOrder.getCustomerId())
-                    .productId(pendingOrder.getProductId())
-                    .quantity(pendingOrder.getQuantity())
-                    .note(pendingOrder.getNote())
-                    .build();
+            if (pendingOrder != null) {
+                // Create order request using builder pattern
+                CreateOrderRequest orderRequest = CreateOrderRequest.builder()
+                        .customerId(pendingOrder.getCustomerId())
+                        .productId(pendingOrder.getProductId())
+                        .quantity(pendingOrder.getQuantity())
+                        .note(pendingOrder.getNote())
+                        .build();
                 
                 // Call service to create order
                 OrderDTO createdOrder = orderService.createOrder(orderRequest);
@@ -527,13 +641,13 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
                 
                 // Send order confirmation
                 String confirmationMessage = String.format(
-                    "✅ Your order has been created successfully!\n\n" +
-                    "🔢 Order ID: #%d\n" +
-                    "🛍️ Product: %s\n" +
-                    "🔢 Quantity: %d\n" +
-                    "🏷️ Status: %s\n" +
-                    "🏠 Delivery address: %s\n\n" +
-                    "Thank you for your purchase!",
+                    "✅ Đơn hàng của bạn đã được tạo thành công!\n\n" +
+                    "🔢 Mã đơn hàng: #%d\n" +
+                    "🛍️ Sản phẩm: %s\n" +
+                    "🔢 Số lượng: %d\n" +
+                    "🏷️ Trạng thái: %s\n" +
+                    "🏠 Địa chỉ giao hàng: %s\n\n" +
+                    "Cảm ơn bạn đã mua hàng!",
                     createdOrder.getId(),
                     createdOrder.getProductName(),
                     createdOrder.getQuantity(),
@@ -545,29 +659,25 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
             }
         } catch (Exception e) {
             log.error("Error updating address for Facebook user {}: {}", senderId, e.getMessage(), e);
-            sendMessage(shopId, senderId, "There was an error updating your address: " + e.getMessage());
+            sendMessage(shopId, senderId, "Đã có lỗi khi cập nhật địa chỉ của bạn: " + e.getMessage());
         }
-    }    // Helper method to find a shop ID from a Facebook page ID
+    }
+
+    // Helper method to find a shop ID from a Facebook page ID
+    // In a real implementation, you would have a mapping table or service
     private Long findShopIdByPageId(String pageId) {
-        try {
-            // Look for active Facebook configuration for this specific page ID
-            Optional<FacebookAccessToken> tokenEntity = facebookAccessTokenRepository
-                    .findByPageIdAndActive(pageId, true);
-            
-            if (tokenEntity.isPresent()) {
-                log.info("Found shop {} for Facebook page {}", tokenEntity.get().getShopId(), pageId);
-                return tokenEntity.get().getShopId();
-            }
-            
-            log.warn("No active Facebook configuration found for page ID: {}", pageId);
-            return null;
-        } catch (Exception e) {
-            log.error("Error finding shop for page ID {}: {}", pageId, e.getMessage(), e);
-            return null;
-        }
-    }    @Override
+        // For demo purposes, we'll try to find a shop that has this page configured
+        // In reality, you would have a more robust mapping mechanism
+        Optional<FacebookAccessToken> tokenEntity = facebookAccessTokenRepository.findAll().stream()
+                .filter(FacebookAccessToken::isActive)
+                .findFirst();
+                
+        return tokenEntity.map(FacebookAccessToken::getShopId).orElse(null);
+    }
+
+    @Override
     public void sendMessage(Long shopId, String recipientId, String message) {
-        FacebookAccessToken tokenEntity = facebookAccessTokenRepository.findFirstByShopIdAndActive(shopId, true)
+        FacebookAccessToken tokenEntity = facebookAccessTokenRepository.findByShopIdAndActive(shopId, true)
                 .orElseThrow(() -> new EntityNotFoundException("Active Facebook configuration not found for shop: " + shopId));
         
         String url = facebookApiUrl + "/me/messages?access_token=" + tokenEntity.getAccessToken();
@@ -587,39 +697,21 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
         
         HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
         
-        boolean success = false;
-        String errorMessage = null;
-        
         try {
             restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
-            success = true;
-            log.debug("Successfully sent message to Facebook user {}", recipientId);
         } catch (Exception e) {
-            errorMessage = e.getMessage();
             log.error("Error sending message to Facebook: {}", e.getMessage(), e);
-            throw new RuntimeException("Failed to send message to Facebook", e);        } finally {
-            // Log outgoing message if monitoring is available
-            try {
-                if (facebookMonitoringService != null) {
-                    facebookMonitoringService.logOutgoingMessage(shopId, tokenEntity.getPageId(), 
-                            "system", recipientId, message, success, errorMessage);
-                }
-            } catch (Exception monitoringException) {
-                log.debug("Monitoring service unavailable: {}", monitoringException.getMessage());
-            }
+            throw new RuntimeException("Failed to send message to Facebook", e);
         }
     }
-      private void subscribeToWebhook(String accessToken) {
+    
+    private void subscribeToWebhook(String accessToken) {
         String url = facebookApiUrl + "/me/subscribed_apps?access_token=" + accessToken;
         
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         
-        // Create request body with required subscribed_fields parameter
-        Map<String, Object> requestBody = new HashMap<>();
-        requestBody.put("subscribed_fields", "messages,messaging_postbacks");
-        
-        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
+        HttpEntity<String> entity = new HttpEntity<>("{}", headers);
         
         try {
             restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
@@ -634,216 +726,4 @@ public class FacebookBotServiceImpl implements FacebookBotService {    private f
         new SecureRandom().nextBytes(randomBytes);
         return Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes);
     }
-
-    @Override
-    public void savePageConfiguration(Long shopId, FacebookWebhookConfigDto.CreateRequest request) {
-        try {
-            // Check if this page is already configured for any shop
-            Optional<FacebookAccessToken> existingPage = facebookAccessTokenRepository.findByPageId(request.getPageId());
-            if (existingPage.isPresent()) {
-                throw new RuntimeException("This Facebook page is already configured for another shop");
-            }
-              // Validate access token with Facebook API
-            if (!facebookPageValidationService.validatePageAccessToken(request.getAccessToken(), request.getPageId())) {
-                throw new RuntimeException("Invalid page access token or page ID");
-            }
-            
-            // Create new configuration
-            FacebookAccessToken tokenEntity = FacebookAccessToken.builder()
-                    .shopId(shopId)
-                    .pageId(request.getPageId())
-                    .pageName(request.getPageName())
-                    .accessToken(request.getAccessToken())
-                    .verifyToken(request.getVerifyToken())
-                    .webhookUrl(request.getWebhookUrl())
-                    .subscribedEvents(request.getSubscribedEvents() != null ? 
-                            String.join(",", request.getSubscribedEvents()) : "messages,messaging_postbacks")
-                    .active(true)
-                    .build();
-            
-            facebookAccessTokenRepository.save(tokenEntity);
-            
-            // Subscribe page to webhook
-            subscribePageToWebhook(shopId, request.getPageId());
-            
-            log.info("Successfully configured Facebook page {} for shop {}", request.getPageId(), shopId);
-            
-        } catch (Exception e) {
-            log.error("Error saving page configuration for shop {}: {}", shopId, e.getMessage(), e);
-            throw new RuntimeException("Failed to save page configuration: " + e.getMessage());
-        }
-    }
-    
-    @Override
-    public void updatePageConfiguration(Long shopId, String pageId, FacebookWebhookConfigDto.UpdateRequest request) {
-        try {
-            FacebookAccessToken tokenEntity = facebookAccessTokenRepository.findByPageIdAndActive(pageId, true)
-                    .orElseThrow(() -> new EntityNotFoundException("Facebook page configuration not found"));
-            
-            if (!tokenEntity.getShopId().equals(shopId)) {
-                throw new RuntimeException("This page does not belong to the specified shop");
-            }
-            
-            // Update fields if provided
-            if (request.getPageName() != null) {
-                tokenEntity.setPageName(request.getPageName());
-            }            if (request.getAccessToken() != null) {
-                if (!facebookPageValidationService.validatePageAccessToken(request.getAccessToken(), pageId)) {
-                    throw new RuntimeException("Invalid page access token");
-                }
-                tokenEntity.setAccessToken(request.getAccessToken());
-            }
-            if (request.getVerifyToken() != null) {
-                tokenEntity.setVerifyToken(request.getVerifyToken());
-            }
-            if (request.getWebhookUrl() != null) {
-                tokenEntity.setWebhookUrl(request.getWebhookUrl());
-            }
-            if (request.getSubscribedEvents() != null) {
-                tokenEntity.setSubscribedEvents(String.join(",", request.getSubscribedEvents()));
-            }
-            if (request.getActive() != null) {
-                tokenEntity.setActive(request.getActive());
-            }
-            
-            facebookAccessTokenRepository.save(tokenEntity);
-            
-            log.info("Successfully updated Facebook page configuration {} for shop {}", pageId, shopId);
-            
-        } catch (Exception e) {
-            log.error("Error updating page configuration for shop {} and page {}: {}", shopId, pageId, e.getMessage(), e);
-            throw new RuntimeException("Failed to update page configuration: " + e.getMessage());
-        }
-    }
-    
-    @Override
-    public void deletePageConfiguration(Long shopId, String pageId) {
-        try {
-            FacebookAccessToken tokenEntity = facebookAccessTokenRepository.findByPageIdAndActive(pageId, true)
-                    .orElseThrow(() -> new EntityNotFoundException("Facebook page configuration not found"));
-            
-            if (!tokenEntity.getShopId().equals(shopId)) {
-                throw new RuntimeException("This page does not belong to the specified shop");
-            }
-            
-            // Unsubscribe from webhook first
-            try {
-                unsubscribePageFromWebhook(shopId, pageId);
-            } catch (Exception e) {
-                log.warn("Failed to unsubscribe page from webhook: {}", e.getMessage());
-            }
-            
-            // Delete configuration
-            facebookAccessTokenRepository.delete(tokenEntity);
-            
-            log.info("Successfully deleted Facebook page configuration {} for shop {}", pageId, shopId);
-            
-        } catch (Exception e) {
-            log.error("Error deleting page configuration for shop {} and page {}: {}", shopId, pageId, e.getMessage(), e);
-            throw new RuntimeException("Failed to delete page configuration: " + e.getMessage());
-        }
-    }
-      @Override
-    public List<FacebookWebhookConfigDto> getShopPageConfigurations(Long shopId) {
-        try {
-            List<FacebookAccessToken> configurations = facebookAccessTokenRepository.findAllByShopId(shopId);
-            
-            return configurations.stream()
-                    .map(config -> FacebookWebhookConfigDto.builder()
-                            .pageId(config.getPageId())
-                            .pageName(config.getPageName())
-                            .webhookUrl(config.getWebhookUrl())
-                            .verifyToken(config.getVerifyToken())                            .subscribedEvents(config.getSubscribedEvents() != null ? 
-                                    Arrays.asList(config.getSubscribedEvents().split(",")) : Arrays.asList())
-                            .active(config.isActive())
-                            .build())
-                    .collect(java.util.stream.Collectors.toList());
-                    
-        } catch (Exception e) {
-            log.error("Error getting page configurations for shop {}: {}", shopId, e.getMessage(), e);
-            throw new RuntimeException("Failed to get page configurations: " + e.getMessage());
-        }
-    }
-    
-    @Override
-    public FacebookWebhookConfigDto getPageConfiguration(Long shopId, String pageId) {
-        try {
-            FacebookAccessToken tokenEntity = facebookAccessTokenRepository.findByPageId(pageId)
-                    .orElseThrow(() -> new EntityNotFoundException("Facebook page configuration not found"));
-            
-            if (!tokenEntity.getShopId().equals(shopId)) {
-                throw new RuntimeException("This page does not belong to the specified shop");
-            }
-            
-            return FacebookWebhookConfigDto.builder()
-                    .pageId(tokenEntity.getPageId())
-                    .pageName(tokenEntity.getPageName())
-                    .webhookUrl(tokenEntity.getWebhookUrl())
-                    .verifyToken(tokenEntity.getVerifyToken())
-                    .subscribedEvents(tokenEntity.getSubscribedEvents() != null ? 
-                            List.of(tokenEntity.getSubscribedEvents().split(",")) : List.of())
-                    .active(tokenEntity.isActive())
-                    .build();
-                    
-        } catch (Exception e) {
-            log.error("Error getting page configuration for shop {} and page {}: {}", shopId, pageId, e.getMessage(), e);
-            throw new RuntimeException("Failed to get page configuration: " + e.getMessage());
-        }
-    }
-    
-    @Override
-    public void subscribePageToWebhook(Long shopId, String pageId) {
-        try {
-            FacebookAccessToken tokenEntity = facebookAccessTokenRepository.findByPageIdAndActive(pageId, true)
-                    .orElseThrow(() -> new EntityNotFoundException("Active Facebook page configuration not found"));
-            
-            if (!tokenEntity.getShopId().equals(shopId)) {
-                throw new RuntimeException("This page does not belong to the specified shop");
-            }
-            
-            String url = facebookApiUrl + "/" + pageId + "/subscribed_apps?access_token=" + tokenEntity.getAccessToken();
-            
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.APPLICATION_JSON);
-            
-            // Subscribe to specific events
-            Map<String, Object> requestBody = new HashMap<>();
-            if (tokenEntity.getSubscribedEvents() != null && !tokenEntity.getSubscribedEvents().isEmpty()) {
-                requestBody.put("subscribed_fields", tokenEntity.getSubscribedEvents());
-            } else {
-                requestBody.put("subscribed_fields", "messages,messaging_postbacks");
-            }
-            
-            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
-            
-            restTemplate.exchange(url, HttpMethod.POST, entity, String.class);
-            
-            log.info("Successfully subscribed page {} to webhook for shop {}", pageId, shopId);
-            
-        } catch (Exception e) {
-            log.error("Error subscribing page {} to webhook for shop {}: {}", pageId, shopId, e.getMessage(), e);
-            throw new RuntimeException("Failed to subscribe page to webhook: " + e.getMessage());
-        }
-    }
-    
-    @Override
-    public void unsubscribePageFromWebhook(Long shopId, String pageId) {
-        try {
-            FacebookAccessToken tokenEntity = facebookAccessTokenRepository.findByPageId(pageId)
-                    .orElseThrow(() -> new EntityNotFoundException("Facebook page configuration not found"));
-            
-            if (!tokenEntity.getShopId().equals(shopId)) {
-                throw new RuntimeException("This page does not belong to the specified shop");
-            }
-            
-            String url = facebookApiUrl + "/" + pageId + "/subscribed_apps?access_token=" + tokenEntity.getAccessToken();
-            
-            restTemplate.exchange(url, HttpMethod.DELETE, null, String.class);
-            
-            log.info("Successfully unsubscribed page {} from webhook for shop {}", pageId, shopId);
-            
-        } catch (Exception e) {
-            log.error("Error unsubscribing page {} from webhook for shop {}: {}", pageId, shopId, e.getMessage(), e);
-            throw new RuntimeException("Failed to unsubscribe page from webhook: " + e.getMessage());
-        }    }
 }
